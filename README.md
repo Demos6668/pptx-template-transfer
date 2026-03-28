@@ -2,7 +2,7 @@
 
 Apply one deck's visual design — logos, shapes, backgrounds, branding — to another deck's text content. Built on `python-pptx`.
 
-**Single file. One command.**
+**Single file. One command. Any PPTX pair.**
 
 ## The Problem
 
@@ -10,7 +10,7 @@ Real-world branded PPTX files store all visual design (logos, decorative shapes,
 
 ## The Solution
 
-**Design mode** clones template slides as visual skeletons, then injects content text into them. The result has the template's complete visual identity with the content's text.
+**Design mode** clones template slides as visual skeletons, classifies every shape's role, and injects content text ONLY into the right zones — leaving all branding untouched.
 
 ## Requirements
 
@@ -27,110 +27,186 @@ pip install -r requirements.txt
 # Auto-detect mode (design mode if layouts are blank, layout mode otherwise)
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx
 
-# Explicit design mode (clone template slides, inject content text)
+# Explicit design mode
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode design
 
-# Explicit layout mode (transfer theme + masters + layouts)
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode layout
-
-# Verbose diagnostics (see every shape classification decision)
+# Verbose diagnostics (every shape classification decision)
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --verbose
 
-# Manual slide mapping (JSON: content slide number → template slide number)
+# JSON report for automation
+python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --report report.json
+
+# Manual slide mapping
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --slide-map mapping.json
+
+# Skip speaker notes transfer
+python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --no-notes
+```
+
+## Programmatic API
+
+```python
+from pptx_template_transfer import transfer, TransferConfig, Thresholds
+
+# Basic usage
+report = transfer(
+    template=Path("template.pptx"),
+    content=Path("content.pptx"),
+    output=Path("output.pptx"),
+)
+
+# Custom config
+config = TransferConfig(
+    mode="design",
+    verbose=True,
+    preserve_notes=True,
+    thresholds=Thresholds(title_min_font_pt=18, body_max_zones=3),
+)
+report = transfer(template, content, output, config)
 ```
 
 ## How Design Mode Works
 
-1. **Extract** structured content from each content slide (title, body paragraphs, tables, images)
-2. **Classify** each template slide's structure: title, narrative, list, grid, data, visual, section, closing
-3. **Match** each content slide to the best template slide using type compatibility, text density, content structure, and position preference — with variety enforcement so the output uses diverse template slides
-4. **Clone** the matched template slide into the output (preserving ALL decorative elements, images, shapes, backgrounds)
-5. **Classify** every shape on the cloned slide as: title | body | info | decorative | footer | media
-6. **Inject** content text ONLY into title/body/info zones — all other shapes are protected
-7. **Post-process** page numbers and dates
+1. **Validate** input files (valid ZIP, has slides, correct format)
+2. **Extract** structured content from each slide (title, body paragraphs with subheading detection, tables, images, charts, speaker notes)
+3. **Classify** each template slide's structure: title, narrative, list, grid, data, visual, section, closing
+4. **Match** each content slide to the best template using type compatibility, text density, content structure, and position — with variety enforcement
+5. **Clone** the matched template slide (preserving ALL shapes, backgrounds, transitions, media)
+6. **Classify** every shape on the cloned slide: title | body | info | decorative | footer | media — with confidence scoring
+7. **Inject** content ONLY into title/body/info zones — all other shapes protected
+8. **Handle** tables (fill with content data, expand rows if needed), charts (best-effort cloning), and images (place in available space)
+9. **Transfer** speaker notes from content to output
+10. **Post-process** page numbers and dates (both text patterns and XML placeholders)
+11. **Validate** output for orphaned shapes or missing content
 
 ### Shape Role Classification
 
-Each shape on a template slide is classified into one of six roles:
+Each shape is classified using multiple signals:
 
-| Role | Description | Action |
-|------|-------------|--------|
-| **title** | Primary heading (largest font, top of slide) | Text replaced with content title |
-| **body** | Main content area (large area, substantial text) | Text replaced with content paragraphs |
-| **info** | Sidebar/panel (right side, moderate text) | Text replaced with content summary |
-| **footer** | Bottom/top edge, page numbers, dates, legal text | Protected (page numbers auto-updated) |
-| **media** | Pictures, charts, tables, OLE objects, groups | Protected |
-| **decorative** | Logos, labels, diagrams, small shapes, patterns | Protected |
+| Signal | Priority | Description |
+|--------|----------|-------------|
+| **Placeholder type** | Highest | PowerPoint's `PP_PLACEHOLDER.TITLE/BODY/FOOTER` |
+| **Shape name** | High | "title", "body", "content" in auto-generated names |
+| **Position + area** | Medium | Footer zone (bottom 10%), header zone (top 8%) |
+| **Font size** | Medium | Adaptive thresholds based on slide-level statistics |
+| **Text patterns** | Medium | "Page XX", "Confidential", dates, ALL-CAPS labels |
+| **Repeated patterns** | Medium | 3+ shapes with similar size in a row/grid → decorative |
+| **Word count** | Lower | ≤3 words → likely decorative, >10 words → likely body |
 
-Classification uses position, font size, area, word count, ALL-CAPS detection, footer text patterns, and repeated pattern detection (for diagram/grid elements).
+Each classification includes a **confidence score** (0.0-1.0) visible in verbose mode.
+
+| Role | Max per slide | Action |
+|------|--------------|--------|
+| **title** | 1 | Text replaced with content title |
+| **body** | 2 | Text replaced with content paragraphs (multi-level format preserved) |
+| **info** | 1 | Text replaced with content summary (first 3 paragraphs) |
+| **footer** | unlimited | Protected (page numbers auto-updated) |
+| **media** | unlimited | Protected (pictures, charts, tables, groups, OLE) |
+| **decorative** | unlimited | Protected (logos, labels, diagrams, branding) |
 
 ### Content Structure Extraction
 
 Each content slide is parsed into:
 - **Title**: Largest-font short text near the top
-- **Body paragraphs**: Ordered text with subheading detection (bold/large font), indentation levels
-- **Tables**: Cell text matrices with dimensions
-- **Images**: Content images (>10% of slide area) for potential transfer
+- **Body paragraphs**: Ordered text with subheading detection (bold/large font), indentation levels, per-run hyperlinks
+- **Tables**: Cell text matrices with formatting
+- **Images**: Content images >10% of slide area
+- **Charts**: Chart elements for best-effort cloning
+- **Speaker notes**: Full text from notes pane
 
-### Slide Matching Score
+### Formatting Preservation
+
+- **Multi-level format**: Each indent level (0-8) gets its own saved formatting from the template
+- **Bullet styles**: `buChar`, `buAutoNum`, `buFont` preserved from template paragraph properties
+- **Bold/italic subheadings**: Detected in content and applied during injection
+- **Overflow prevention**: Estimates shape text capacity; truncates with "..." if content exceeds it
+
+### Slide Matching
 
 ```
 Score = type_compatibility (0-40) + text_density_fit (0-25)
       + content_structure_fit (0-20) + position_preference (0-15)
 ```
 
-**Variety enforcement**: No template slide gets more than 40% of mappings. Unused templates are redistributed to ensure visual diversity.
+**Variety enforcement**: No template slide gets >40% of mappings. Unused templates are redistributed.
 
 ### Table Handling
 
-- Template has table + content has table → content data fills template table (preserving template styling)
-- Content has table but template doesn't → table element is added to the output slide
-- Template has table but content doesn't → table contents are cleared
+- Template has table + content has table → content fills template cells (preserving cell formatting)
+- Content table has more rows → template table is expanded (row cloning)
+- No table in template → content table element added to slide
 
-### Image Handling
+### Robustness
 
-- Template images (logos, backgrounds) are always preserved
-- Content images >10% of slide area are placed in available whitespace on the output slide
-
-### Post-Processing
-
-- Page numbers (`Page 01`, `Page 02`, ...) are updated to match actual slide position
-- Dates in footer areas are updated to today's date
+- **Per-slide error isolation**: One failed slide doesn't abort the entire deck
+- **Input validation**: Checks for valid ZIP, Content_Types.xml, non-zero slides
+- **Broken relationship recovery**: Logs broken rIds instead of silent failure
+- **Large deck support**: Pre-computed ShapeInfo cache, single-pass property extraction
 
 ## Verbose Mode
-
-Use `--verbose` (or `-v`) to see detailed diagnostics for every slide:
 
 ```
 Slide 4/16:
   Content type: content (79 words, 0 table(s), 1 image(s))
   Template match: slide 6 (score=75, type=narrative)
   Shape classifications:
-    Shape "Shape 0" (4.6% area, top 67%) -> footer
-    Shape "Text 3" (6.8% area, top 11%) "Day2.Work™ ..." -> title
-    Shape "Text 7" (7.9% area, top 42%) "• 24x7 ..." -> body
+    Shape "Shape 0" (4.6% area, top 67%, conf=0.85) -> footer
+    Shape "Text 3" (6.8% area, top 11%, conf=0.85) "Day2.Work..." -> title
+    Shape "Text 7" (7.9% area, top 42%, conf=0.80) "24x7 ..." -> body
     ...
   Injected: title="Deployment Overview"
   Injected: body (75 words -> 2 zones)
   Protected: 27 shapes untouched
 ```
 
-## Using with Claude
+## JSON Report
 
-```bash
-git clone https://github.com/Demos6668/pptx-template-transfer.git
-pip install -r pptx-template-transfer/requirements.txt
-python3 pptx-template-transfer/pptx_template_transfer.py template.pptx content.pptx output.pptx
+Use `--report report.json` for machine-readable output:
+
+```json
+{
+  "mode": "design",
+  "slides": [
+    {
+      "index": 1,
+      "content_type": "title",
+      "template_slide": 1,
+      "template_type": "title",
+      "title": "Managed Detection and Response (MDR) Report",
+      "word_count": 17,
+      "status": "ok",
+      "protected_shapes": 27,
+      "classifications": [...]
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}
+```
+
+## Configuration
+
+All classification thresholds are configurable via the `Thresholds` dataclass:
+
+```python
+from pptx_template_transfer import Thresholds
+
+# For templates with smaller fonts
+th = Thresholds(title_min_font_pt=16, decorative_max_font_pt=8)
+
+# For templates with more body zones
+th = Thresholds(body_max_zones=3, body_min_area_pct=3.0)
 ```
 
 ## Technical Notes
 
 - Built on `python-pptx` with `lxml` for low-level XML manipulation
-- Slide cloning deep-copies all shape elements and remaps relationship IDs for media
-- Text injection preserves template run properties (font, size, color, bold) — only text nodes are replaced
-- Structured injection preserves paragraph hierarchy: subheadings as bold, indentation levels maintained
-- Template images are always preserved (they're branding); content images transferred where space allows
+- Slide cloning deep-copies all shape elements and remaps relationship IDs
+- Transitions are preserved from template slides
+- Speaker notes transferred from content to output
+- Text injection preserves template run properties per indent level
+- Table cell formatting preserved during data fill (not stripped by `cell.text = ...`)
+- Chart transfer is best-effort (copies chart part + element)
 - Output uses the template's slide dimensions
 
 ## License
