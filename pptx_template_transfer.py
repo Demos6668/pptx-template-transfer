@@ -722,6 +722,20 @@ def extract_content(
                 content.title = txt
                 break
 
+    # --- Add title shape as a positioned TextBlock (for recreate mode) ---
+    if title_shape and _text_of(title_shape) and slide_w > 0 and slide_h > 0:
+        paras = _extract_paragraphs_from_shape(title_shape)
+        if paras:
+            content.text_blocks.append(TextBlock(
+                paragraphs=paras,
+                left_pct=(title_shape.left or 0) / slide_w * 100,
+                top_pct=(title_shape.top or 0) / slide_h * 100,
+                width_pct=(title_shape.width or 0) / slide_w * 100,
+                height_pct=(title_shape.height or 0) / slide_h * 100,
+                is_heading=True,
+                is_label=False,
+            ))
+
     # --- Body extraction (flat paragraphs + positioned text blocks) ---
     body_shapes = [
         s for s in shapes
@@ -2601,8 +2615,8 @@ def build_slide(
         _add_header(slide, style, section_label)
         _add_footer(slide, style, slide_number, total_slides)
 
-        # Title
-        if content.title:
+        # Title — skip if text_blocks present (title is already in text_blocks)
+        if content.title and not content.text_blocks:
             _add_title_text(
                 slide, style, content.title,
                 margin_left, title_top, content_width,
@@ -2664,54 +2678,63 @@ def _build_title_slide(
     sw, sh = style.slide_width, style.slide_height
     # NOTE: logo already added by build_slide() — no duplicate call here
 
-    # Large centered title
-    title_width = int(sw * 0.7)
-    title_left = (sw - title_width) // 2
-    title_top = int(sh * 0.28)
-
-    if content.title:
-        tb = slide.shapes.add_textbox(title_left, title_top, title_width, int(sh * 0.15))
-        tf = tb.text_frame
-        tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.text = content.title
-        p.alignment = PP_ALIGN.CENTER
-        _style_runs(p, font_name=style.heading_font, font_size_pt=30,
-                     bold=True, color_hex=style.color_text)
-
-    # Body content — positioned blocks preserve complex layouts
+    # Use positioned text_blocks when available (preserves original layout)
     if content.text_blocks:
         _add_text_blocks(slide, style, content.text_blocks)
-    elif content.body_paragraphs:
-        sub_top = title_top + int(sh * 0.18)
-        sub_width = int(sw * 0.6)
-        sub_left = (sw - sub_width) // 2
-        tb = slide.shapes.add_textbox(sub_left, sub_top, sub_width, int(sh * 0.25))
-        tf = tb.text_frame
-        tf.word_wrap = True
-        first = True
-        for pd in content.body_paragraphs:
-            if first:
-                p = tf.paragraphs[0]
-                first = False
-            else:
-                p = tf.add_paragraph()
-            p.text = pd.text
-            p.alignment = PP_ALIGN.CENTER
-            _style_runs(p, font_name=style.body_font, font_size_pt=14,
-                         color_hex=style.color_muted)
+    else:
+        # Fallback: centered title + subtitle
+        title_width = int(sw * 0.7)
+        title_left = (sw - title_width) // 2
+        title_top = int(sh * 0.28)
 
-    # Accent line under title
-    line_w = int(sw * 0.08)
-    line_left = (sw - line_w) // 2
-    line_top = title_top + int(sh * 0.14)
-    line_shape = slide.shapes.add_shape(
-        1,  # RECTANGLE
-        line_left, line_top, line_w, Pt(3),
-    )
-    line_shape.fill.solid()
-    line_shape.fill.fore_color.rgb = _rgb(style.color_primary)
-    line_shape.line.fill.background()
+        if content.title:
+            tb = slide.shapes.add_textbox(title_left, title_top, title_width, int(sh * 0.15))
+            tf = tb.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            p.text = content.title
+            p.alignment = PP_ALIGN.CENTER
+            _style_runs(p, font_name=style.heading_font, font_size_pt=30,
+                         bold=True, color_hex=style.color_text)
+
+        if content.body_paragraphs:
+            sub_top = title_top + int(sh * 0.18)
+            sub_width = int(sw * 0.6)
+            sub_left = (sw - sub_width) // 2
+            tb = slide.shapes.add_textbox(sub_left, sub_top, sub_width, int(sh * 0.25))
+            tf = tb.text_frame
+            tf.word_wrap = True
+            first = True
+            for pd in content.body_paragraphs:
+                if first:
+                    p = tf.paragraphs[0]
+                    first = False
+                else:
+                    p = tf.add_paragraph()
+                p.text = pd.text
+                p.alignment = PP_ALIGN.CENTER
+                _style_runs(p, font_name=style.body_font, font_size_pt=14,
+                             color_hex=style.color_muted)
+
+        # Accent line under title
+        title_top = int(sh * 0.28)
+        line_w = int(sw * 0.08)
+        line_left = (sw - line_w) // 2
+        line_top = title_top + int(sh * 0.14)
+        line_shape = slide.shapes.add_shape(
+            1,  # RECTANGLE
+            line_left, line_top, line_w, Pt(3),
+        )
+        line_shape.fill.solid()
+        line_shape.fill.fore_color.rgb = _rgb(style.color_primary)
+        line_shape.line.fill.background()
+
+    # Content images at original positions
+    if content.images:
+        body_top = int(sh * 0.22)
+        _add_content_images(slide, style, content.images, body_top,
+                            has_body_text=bool(content.body_paragraphs),
+                            preserve_position=bool(content.text_blocks))
 
     _add_footer(slide, style, slide_number, total_slides)
 
