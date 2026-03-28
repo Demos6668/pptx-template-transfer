@@ -570,9 +570,22 @@ class ParagraphData:
 
 
 @dataclass
+class TextBlock:
+    """A positioned text group preserving spatial layout from the source slide."""
+    paragraphs: list[ParagraphData] = field(default_factory=list)
+    left_pct: float = 0.0   # % of slide width
+    top_pct: float = 0.0    # % of slide height
+    width_pct: float = 20.0
+    height_pct: float = 10.0
+    is_heading: bool = False  # bold/large short text
+    is_label: bool = False    # very short text (≤3 words), e.g. numbers, tags
+
+
+@dataclass
 class ContentData:
     title: str = ""
     body_paragraphs: list[ParagraphData] = field(default_factory=list)
+    text_blocks: list[TextBlock] = field(default_factory=list)
     tables: list[dict] = field(default_factory=list)
     images: list[tuple] = field(default_factory=list)
     charts: list[Any] = field(default_factory=list)  # chart element + rels
@@ -709,10 +722,17 @@ def extract_content(
                 content.title = txt
                 break
 
-    # --- Body extraction ---
+    # --- Body extraction (flat paragraphs + positioned text blocks) ---
     body_shapes = [
         s for s in shapes
         if s is not title_shape and _text_of(s) and not _is_table(s) and not _is_chart(s)
+    ]
+    # Filter out footer-zone shapes from body
+    body_shapes = [
+        s for s in body_shapes
+        if _shape_bottom_frac(s, slide_h) <= 0.92
+        and not _FOOTER_PATTERNS.match(_text_of(s).strip())
+        and not (_placeholder_type_int(s) is not None and _placeholder_type_int(s) in _PH_FOOTER_SET)
     ]
     body_shapes.sort(key=lambda s: ((s.top or 0), (s.left or 0)))
 
@@ -722,6 +742,25 @@ def extract_content(
             if p.bold or (p.font_size >= th.subheading_min_font_pt and _word_count(p.text) <= 10):
                 p.bold = True
             content.body_paragraphs.append(p)
+
+        # Also build positioned TextBlock for recreate mode
+        if paras and slide_w > 0 and slide_h > 0:
+            text = _text_of(shape)
+            wc = _word_count(text)
+            max_fs = _max_font_pt(shape)
+            is_heading = (max_fs >= th.subheading_min_font_pt and wc <= 10) or (
+                paras[0].bold and wc <= 10
+            )
+            is_label = wc <= 3 and max_fs < 20
+            content.text_blocks.append(TextBlock(
+                paragraphs=paras,
+                left_pct=(shape.left or 0) / slide_w * 100,
+                top_pct=(shape.top or 0) / slide_h * 100,
+                width_pct=(shape.width or 0) / slide_w * 100,
+                height_pct=(shape.height or 0) / slide_h * 100,
+                is_heading=is_heading,
+                is_label=is_label,
+            ))
 
     # --- Tables ---
     for shape in shapes:
@@ -2358,6 +2397,55 @@ def _add_body_text(
                          color_hex=style.color_text)
 
 
+def _add_text_blocks(
+    slide, style: TemplateStyle,
+    text_blocks: list[TextBlock],
+) -> None:
+    """Recreate positioned text blocks preserving spatial layout from source."""
+    sw, sh = style.slide_width, style.slide_height
+
+    for block in text_blocks:
+        left = int(sw * block.left_pct / 100)
+        top = int(sh * block.top_pct / 100)
+        width = int(sw * block.width_pct / 100)
+        height = int(sh * block.height_pct / 100)
+
+        # Ensure minimum dimensions
+        width = max(width, int(sw * 0.05))
+        height = max(height, int(sh * 0.02))
+
+        tb = slide.shapes.add_textbox(left, top, width, height)
+        tf = tb.text_frame
+        tf.word_wrap = True
+
+        first = True
+        for pd in block.paragraphs:
+            if first:
+                p = tf.paragraphs[0]
+                first = False
+            else:
+                p = tf.add_paragraph()
+
+            p.text = pd.text
+
+            if block.is_label:
+                # Small labels: numbers, tags — use accent color, compact
+                _style_runs(p, font_name=style.body_font, font_size_pt=10,
+                             bold=True, color_hex=style.color_primary)
+            elif block.is_heading or pd.bold:
+                # Section headings
+                p.space_before = Pt(4)
+                _style_runs(p, font_name=style.heading_font, font_size_pt=13,
+                             bold=True, color_hex=style.color_text)
+            elif pd.level > 0:
+                p.level = pd.level
+                _style_runs(p, font_name=style.body_font, font_size_pt=10,
+                             color_hex=style.color_muted)
+            else:
+                _style_runs(p, font_name=style.body_font, font_size_pt=11,
+                             color_hex=style.color_text)
+
+
 def _add_table(
     slide, style: TemplateStyle,
     table_data: list[list[str]],
@@ -2512,8 +2600,10 @@ def build_slide(
         # Determine if we have images to place on the right
         has_images = bool(content.images)
 
-        # Body text
-        if content.body_paragraphs:
+        # Body text — prefer positioned text_blocks for spatial layout
+        if content.text_blocks:
+            _add_text_blocks(slide, style, content.text_blocks)
+        elif content.body_paragraphs:
             bw = int(sw * 0.55) if has_images else int(sw * 0.85)
             _add_body_text(
                 slide, style, content.body_paragraphs,
@@ -2523,7 +2613,7 @@ def build_slide(
         # Tables
         if content.tables:
             table_top = body_top
-            if content.body_paragraphs:
+            if content.body_paragraphs and not content.text_blocks:
                 # Estimate body height
                 est_lines = sum(1 + len(p.text) // 60 for p in content.body_paragraphs)
                 table_top = body_top + int(est_lines * Pt(16))
@@ -2536,7 +2626,7 @@ def build_slide(
                 )
                 break  # Only first table
 
-        # Images on the right side
+        # Images — use positioned placement if text_blocks mode, else right-side
         if content.images:
             _add_content_images(slide, style, content.images, body_top,
                                 has_body_text=bool(content.body_paragraphs))
@@ -2575,8 +2665,10 @@ def _build_title_slide(
         _style_runs(p, font_name=style.heading_font, font_size_pt=30,
                      bold=True, color_hex=style.color_text)
 
-    # Subtitle / body paragraphs below title
-    if content.body_paragraphs:
+    # Body content — positioned blocks preserve complex layouts
+    if content.text_blocks:
+        _add_text_blocks(slide, style, content.text_blocks)
+    elif content.body_paragraphs:
         sub_top = title_top + int(sh * 0.18)
         sub_width = int(sw * 0.6)
         sub_left = (sw - sub_width) // 2
