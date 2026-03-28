@@ -6,5 +6,5 @@ __pycache__/
 tmp/
 temp/
 *.zip
-test_*.py
+# test_*.py
 .env
