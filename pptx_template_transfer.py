@@ -67,7 +67,7 @@ class Thresholds:
     info_min_words: int = 5
     info_max_words: int = 50
     # Content extraction
-    image_min_area_pct: float = 3.0
+    image_min_area_pct: float = 1.5
     subheading_min_font_pt: float = 18.0
     # Matching
     variety_max_pct: float = 0.40
@@ -2488,22 +2488,33 @@ def _add_content_images(
     images: list[tuple],
     start_top: int,
     has_body_text: bool = True,
+    preserve_position: bool = False,
 ) -> None:
     """Place content images on the slide."""
     sw, sh = style.slide_width, style.slide_height
-    current_top = start_top
-
-    # If no body text, images can take more space
-    max_w_frac = 0.42 if has_body_text else 0.70
-    max_h_frac = 0.35 if has_body_text else 0.55
 
     for img_tuple in images:
         blob = img_tuple[0]
         orig_w, orig_h = img_tuple[1], img_tuple[2]
+        orig_left = img_tuple[3] if len(img_tuple) > 3 else 0
+        orig_top = img_tuple[4] if len(img_tuple) > 4 else start_top
 
+        if preserve_position and orig_left > 0 and orig_top > 0:
+            # Place at original position, keeping original size
+            try:
+                slide.shapes.add_picture(
+                    io.BytesIO(blob), orig_left, orig_top, orig_w, orig_h,
+                )
+            except Exception:
+                pass
+            continue
+
+        # Fallback: right-side placement
+        max_w_frac = 0.42 if has_body_text else 0.70
+        max_h_frac = 0.35 if has_body_text else 0.55
         max_w = int(sw * max_w_frac)
         max_h = int(sh * max_h_frac)
-        avail_h = sh - current_top - int(sh * 0.08)
+        avail_h = sh - start_top - int(sh * 0.08)
         if avail_h < int(sh * 0.1):
             break
         max_h = min(max_h, avail_h)
@@ -2517,8 +2528,8 @@ def _add_content_images(
 
         try:
             left = sw - w - int(sw * 0.04)
-            slide.shapes.add_picture(io.BytesIO(blob), left, current_top, w, h)
-            current_top += h + Pt(8)
+            slide.shapes.add_picture(io.BytesIO(blob), left, start_top, w, h)
+            start_top += h + Pt(8)
         except Exception:
             pass
 
@@ -2628,8 +2639,11 @@ def build_slide(
 
         # Images — use positioned placement if text_blocks mode, else right-side
         if content.images:
-            _add_content_images(slide, style, content.images, body_top,
-                                has_body_text=bool(content.body_paragraphs))
+            _add_content_images(
+                slide, style, content.images, body_top,
+                has_body_text=bool(content.body_paragraphs),
+                preserve_position=bool(content.text_blocks),
+            )
 
     # Speaker notes
     if content.notes:
