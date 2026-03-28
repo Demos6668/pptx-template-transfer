@@ -1,58 +1,76 @@
 # PPTX Template Transfer
 
-One-command template/theme transfer between PowerPoint files. Applies a template PPTX's design (theme, colors, fonts, slide masters, layouts) to a content PPTX while preserving all text and images.
+Apply one deck's visual design — logos, shapes, backgrounds, branding — to another deck's text content. Built on `python-pptx`.
 
-**Single file. Zero config.**
+**Single file. One command.**
 
-## Features
+## The Problem
 
-- **Full theme transfer** — colors, fonts, format schemes
-- **Smart layout mapping** — content-aware analysis infers slide type (title/content/section/blank) and maps to the best branded layout, even when source slides use generic layouts like "DEFAULT"
-- **Text color adaptation** — automatically flips dark-on-dark and light-on-light text after background changes
-- **Relationship ID reconciliation** — fixes rId collisions that cause PowerPoint repair dialogs
-- **Single command** — full pipeline runs automatically
+Real-world branded PPTX files store all visual design (logos, decorative shapes, watermarks, backgrounds) as shapes inside individual slides, NOT in slide masters/layouts. The layouts are often just "BLANK." Traditional layout/master transfer does nothing useful for these files.
+
+## The Solution
+
+**Design mode** clones template slides as visual skeletons, then injects content text into them. The result has the template's complete visual identity with the content's text.
 
 ## Requirements
 
 - Python 3.10+
-- `defusedxml` (`pip install defusedxml`)
-- No other dependencies (stdlib only)
+- `python-pptx` and `Pillow`
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Usage
 
 ```bash
-pip install defusedxml
-
+# Auto-detect mode (design mode if layouts are blank, layout mode otherwise)
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx
+
+# Explicit design mode (clone template slides, inject content text)
+python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode design
+
+# Explicit layout mode (transfer theme + masters + layouts)
+python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode layout
 ```
 
-With a custom layout mapping:
+## How Design Mode Works
+
+1. **Classify** each slide in both decks by type: title, content, section, data, closing, image
+2. **Match** each content slide to the best template slide using type similarity, text density, position in deck, and shape count
+3. **Clone** the matched template slide into the output (preserving ALL decorative elements, images, shapes, backgrounds)
+4. **Inject** the content text into the clone's "content zones" (large text shapes), preserving the template's formatting
+5. **Output** has template's theme, masters, layouts, AND per-slide decorative elements — with the content's text
+
+### Shape Classification
+
+Each shape in a template slide is classified as:
+- **Design** (preserved as-is): images, logos, decorative shapes, branding labels, page numbers, small-font elements
+- **Content zones** (text replaced): large text shapes — title, subtitle, body text areas
+
+### Slide Matching Score
+
+```
+Score = type_match(50) + text_density(20) + deck_position(15) + shape_count(15)
+```
+
+A single template slide can be reused for multiple content slides.
+
+## Using with Claude
 
 ```bash
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --layout-map mapping.json
+git clone https://github.com/Demos6668/pptx-template-transfer.git
+pip install -r pptx-template-transfer/requirements.txt
+python3 pptx-template-transfer/pptx_template_transfer.py template.pptx content.pptx output.pptx
 ```
-
-## Using with Claude on claude.ai
-
-This repo is designed to work as a tool for Claude. When Claude needs to apply a template to a PPTX:
-
-1. Clone this repo into the working directory
-2. Run `python3 pptx_template_transfer.py template.pptx content.pptx output.pptx`
-3. If the auto-mapping needs adjustment, create a `mapping.json` and pass `--layout-map mapping.json`
-
-## How It Works
-
-PPTX files are ZIP archives containing XML files following the OOXML standard. The pipeline:
-
-1. **Theme transfer** — replaces the color scheme, font scheme, and format scheme
-2. **Layout mapping** — analyzes each slide's content (font sizes, positions, text count) to infer whether it's a title slide, content slide, section header, etc., then maps to the best matching branded layout
-3. **Text color adaptation** — walks the slide -> layout -> master hierarchy to determine effective background color, then flips hardcoded text colors that would be invisible
 
 ## Technical Notes
 
-- All XML parsing uses `defusedxml.minidom` exclusively (not `xml.etree.ElementTree`, which corrupts OOXML namespace declarations)
-- Only modifies explicit `srgbClr` values for color adaptation; theme-referenced colors (`schemeClr`) adapt automatically
-- Relationship paths in OOXML are relative (e.g., `../media/image1.png`)
+- Built on `python-pptx` with `lxml` for low-level XML manipulation
+- Slide cloning deep-copies all shape elements and remaps relationship IDs for media
+- Text injection preserves template run properties (font, size, color, bold) — only `<a:t>` text nodes are replaced
+- Template images are always preserved (they're branding); content images are not transferred (they'd conflict with the template layout)
+- Output uses the template's slide dimensions
 
 ## License
 
