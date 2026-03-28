@@ -1246,6 +1246,104 @@ def _clear_shape_text(shape) -> None:
     etree.SubElement(new_p, f'{{{ns_a}}}endParaRPr')
 
 
+# ---- Template text clearing: is_protected + prepare_cloned_slide ----
+
+_JUST_NUMBER_RE = re.compile(r"^\d{1,2}$")
+
+
+def _is_protected_shape(shape, slide_w: int, slide_h: int) -> bool:
+    """Return True if the shape should keep its template text untouched.
+
+    Everything that returns False here is an *injection target* — its text
+    will be erased before content injection so that template words and
+    content words never mix on the same slide.
+    """
+    # No text frame — nothing to clear
+    if not shape.has_text_frame:
+        return True
+
+    # Media shapes (picture, chart, table, group, OLE)
+    if _is_picture(shape) or _is_chart(shape) or _is_table(shape) or _is_group(shape):
+        return True
+    if _is_ole_or_embedded(shape):
+        return True
+
+    # Area check — tiny shapes are labels/decorative
+    area_pct = _shape_area_pct(shape, slide_w, slide_h)
+    if area_pct < 2.0:
+        return True
+
+    # Font size — if ALL text is tiny (≤10 pt), it's a label
+    max_font = _max_font_pt(shape)
+    if 0 < max_font <= 10:
+        return True
+
+    # Word count — ≤3 words = decorative/label
+    text = shape.text_frame.text.strip()
+    words = len(text.split()) if text else 0
+    if words <= 3:
+        return True
+
+    # No text at all
+    if not text:
+        return True
+
+    # Footer zone (bottom 10% of slide)
+    bottom_frac = _shape_bottom_frac(shape, slide_h)
+    if bottom_frac > 0.90:
+        return True
+
+    # Header zone — small shape in top 8%
+    top_frac = _shape_top_frac(shape, slide_h)
+    if top_frac < 0.08 and area_pct < 4.0:
+        return True
+
+    # ALL CAPS short text = section label (e.g. "SECURITY OPERATIONS PROPOSAL")
+    if _is_allcaps_short(text) and words <= 5:
+        return True
+
+    # Common footer/label patterns
+    if _FOOTER_PATTERNS.match(text.strip()):
+        return True
+
+    # Just a number like "01", "02"
+    if _JUST_NUMBER_RE.match(text.strip()):
+        return True
+
+    # Placeholder-based footer (slide number, date, footer)
+    ph = _placeholder_type_int(shape)
+    if ph is not None and ph in _PH_FOOTER_SET:
+        return True
+
+    # NOT protected — this is an injection target
+    return False
+
+
+def _prepare_cloned_slide(
+    slide, slide_w: int, slide_h: int,
+) -> tuple[list, list]:
+    """Erase template text from injection targets, leave protected shapes untouched.
+
+    Returns (injection_targets, protected_shapes) for diagnostic tracking.
+    """
+    targets: list = []
+    protected: list = []
+
+    for shape in slide.shapes:
+        if _is_protected_shape(shape, slide_w, slide_h):
+            protected.append(shape)
+            continue
+
+        # This is an injection target — CLEAR its text
+        targets.append(shape)
+        if shape.has_text_frame:
+            for paragraph in shape.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    run.text = ""
+
+    return targets, protected
+
+
 def inject_content(
     cloned_slide, content_data: ContentData,
     slide_w: int, slide_h: int, th: Thresholds,
@@ -1254,13 +1352,21 @@ def inject_content(
     diag: dict[str, Any] = {
         "shapes": [], "injected_title": None,
         "injected_body": None, "protected_count": 0,
+        "cleared_count": 0,
     }
 
+    # Step 1: Classify shapes BEFORE clearing (needs original text for accuracy)
     classifications = classify_all_shapes(cloned_slide, slide_w, slide_h, th)
 
+    # Step 2: Determine which shapes are injection targets vs protected
+    targets, protected = _prepare_cloned_slide(cloned_slide, slide_w, slide_h)
+    target_ids = {id(s) for s in targets}
+    diag["cleared_count"] = len(targets)
+    diag["protected_count"] = len(protected)
+
+    # Step 3: Use pre-clearing classifications to assign title/body zones
     title_shape = None
     body_shapes: list = []
-    info_shape = None
 
     for shape, role, conf in classifications:
         diag["shapes"].append({
@@ -1269,22 +1375,36 @@ def inject_content(
             "area_pct": round(_shape_area_pct(shape, slide_w, slide_h), 1),
             "top_pct": round(_shape_top_frac(shape, slide_h) * 100, 0),
             "text_preview": _text_of(shape)[:40],
+            "is_target": id(shape) in target_ids,
         })
+        # Only assign zones from shapes that are injection targets
+        if id(shape) not in target_ids:
+            continue
         if role == "title" and title_shape is None:
             title_shape = shape
-        elif role == "body":
+        elif role in ("body", "info"):
             body_shapes.append(shape)
-        elif role == "info" and info_shape is None:
-            info_shape = shape
-        else:
-            diag["protected_count"] += 1
 
+    # Fallback: if classifier didn't find title/body among targets,
+    # pick from targets by font size (title) and area (body)
+    if not title_shape and targets:
+        top_half = [s for s in targets
+                    if s.has_text_frame and _shape_top_frac(s, slide_h) < 0.45]
+        if top_half:
+            title_shape = max(top_half, key=lambda s: _max_font_pt(s))
+
+    if not body_shapes:
+        for s in sorted(targets, key=lambda s: _shape_area(s), reverse=True):
+            if s != title_shape and s.has_text_frame:
+                body_shapes.append(s)
+            if len(body_shapes) >= th.body_max_zones:
+                break
+
+    # Step 4: Inject content into zones (shapes already cleared by step 2)
     # --- Title ---
     if content_data.title and title_shape:
         _inject_text_simple(title_shape, content_data.title)
         diag["injected_title"] = content_data.title[:50]
-    elif title_shape:
-        _clear_shape_text(title_shape)
 
     # --- Body ---
     if content_data.body_paragraphs and body_shapes:
@@ -1304,20 +1424,8 @@ def inject_content(
                 idx += per_zone
                 if chunk:
                     _inject_structured_text(zone, chunk, th, slide_w, slide_h)
-                else:
-                    _clear_shape_text(zone)
             wc = sum(_word_count(p.text) for p in content_data.body_paragraphs)
             diag["injected_body"] = f"{wc} words -> {len(body_shapes)} zones"
-    elif body_shapes:
-        for s in body_shapes:
-            _clear_shape_text(s)
-
-    # --- Info sidebar ---
-    if info_shape:
-        if content_data.body_paragraphs:
-            _inject_structured_text(info_shape, content_data.body_paragraphs[:3], th)
-        else:
-            _clear_shape_text(info_shape)
 
     return diag
 
@@ -1521,6 +1629,30 @@ def _post_process(output_prs: Presentation) -> None:
                         _inject_text_simple(shape, new)
 
 
+def _cleanup_broken_rels(output_prs: Presentation) -> int:
+    """Remove broken relationship references that prevent LibreOffice from opening.
+
+    Returns count of removed relationships.
+    """
+    removed = 0
+    for slide in output_prs.slides:
+        part = slide.part
+        bad_keys: list[str] = []
+        for rel_key, rel in part.rels.items():
+            try:
+                if not rel.is_external:
+                    _ = rel.target_part  # will throw if broken
+            except Exception:
+                bad_keys.append(rel_key)
+        for key in bad_keys:
+            try:
+                del part.rels[key]
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
 def _transfer_notes(src_content: ContentData, dst_slide) -> None:
     """Copy speaker notes from content data to the output slide."""
     if not src_content.notes:
@@ -1577,6 +1709,7 @@ def _print_slide_diagnostic(
         print(f'  Injected: title="{injection_diag["injected_title"]}"')
     if injection_diag.get("injected_body"):
         print(f'  Injected: body ({injection_diag["injected_body"]})')
+    print(f'  Cleared: {injection_diag.get("cleared_count", 0)} template text shapes')
     print(f'  Protected: {injection_diag.get("protected_count", 0)} shapes untouched')
 
 
@@ -1736,6 +1869,11 @@ def apply_design(
     # Step 5: Post-processing
     print("\n[design] Post-processing...")
     _post_process(output_prs)
+
+    # Step 5b: Clean up broken relationships (LibreOffice compatibility)
+    removed_rels = _cleanup_broken_rels(output_prs)
+    if removed_rels:
+        log.info("  Cleaned up %d broken relationship(s)", removed_rels)
 
     # Step 6: Validate
     warnings = _validate_output(output_prs)
