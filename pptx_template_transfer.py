@@ -727,11 +727,11 @@ def extract_content(
         s for s in shapes
         if s is not title_shape and _text_of(s) and not _is_table(s) and not _is_chart(s)
     ]
-    # Filter out footer-zone shapes from body
+    # Filter out only unambiguous footer shapes (placeholders + pattern matches)
+    # Do NOT filter by position — content may have valid text near the bottom
     body_shapes = [
         s for s in body_shapes
-        if _shape_bottom_frac(s, slide_h) <= 0.92
-        and not _FOOTER_PATTERNS.match(_text_of(s).strip())
+        if not _FOOTER_PATTERNS.match(_text_of(s).strip())
         and not (_placeholder_type_int(s) is not None and _placeholder_type_int(s) in _PH_FOOTER_SET)
     ]
     body_shapes.sort(key=lambda s: ((s.top or 0), (s.left or 0)))
