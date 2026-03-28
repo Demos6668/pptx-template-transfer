@@ -1254,9 +1254,9 @@ _JUST_NUMBER_RE = re.compile(r"^\d{1,2}$")
 def _is_protected_shape(shape, slide_w: int, slide_h: int) -> bool:
     """Return True if the shape should keep its template text untouched.
 
-    Everything that returns False here is an *injection target* — its text
-    will be erased before content injection so that template words and
-    content words never mix on the same slide.
+    Aggressively clears ALL template text except truly structural elements
+    (footers, page numbers, dates, confidential notices, empty shapes).
+    This ensures zero template words leak into the output.
     """
     # No text frame — nothing to clear
     if not shape.has_text_frame:
@@ -1268,41 +1268,22 @@ def _is_protected_shape(shape, slide_w: int, slide_h: int) -> bool:
     if _is_ole_or_embedded(shape):
         return True
 
-    # Area check — tiny shapes are labels/decorative
-    area_pct = _shape_area_pct(shape, slide_w, slide_h)
-    if area_pct < 2.0:
-        return True
-
-    # Font size — if ALL text is tiny (≤10 pt), it's a label
-    max_font = _max_font_pt(shape)
-    if 0 < max_font <= 10:
-        return True
-
-    # Word count — ≤3 words = decorative/label
+    # Empty text — nothing to clear
     text = shape.text_frame.text.strip()
-    words = len(text.split()) if text else 0
-    if words <= 3:
-        return True
-
-    # No text at all
     if not text:
         return True
 
-    # Footer zone (bottom 10% of slide)
+    # Placeholder-based footer (slide number, date, footer) — structural
+    ph = _placeholder_type_int(shape)
+    if ph is not None and ph in _PH_FOOTER_SET:
+        return True
+
+    # Footer zone (bottom 8% of slide) — structural
     bottom_frac = _shape_bottom_frac(shape, slide_h)
-    if bottom_frac > 0.90:
+    if bottom_frac > 0.92:
         return True
 
-    # Header zone — small shape in top 8%
-    top_frac = _shape_top_frac(shape, slide_h)
-    if top_frac < 0.08 and area_pct < 4.0:
-        return True
-
-    # ALL CAPS short text = section label (e.g. "SECURITY OPERATIONS PROPOSAL")
-    if _is_allcaps_short(text) and words <= 5:
-        return True
-
-    # Common footer/label patterns
+    # Common footer/label patterns (Page XX, Confidential, dates, ©)
     if _FOOTER_PATTERNS.match(text.strip()):
         return True
 
@@ -1310,12 +1291,7 @@ def _is_protected_shape(shape, slide_w: int, slide_h: int) -> bool:
     if _JUST_NUMBER_RE.match(text.strip()):
         return True
 
-    # Placeholder-based footer (slide number, date, footer)
-    ph = _placeholder_type_int(shape)
-    if ph is not None and ph in _PH_FOOTER_SET:
-        return True
-
-    # NOT protected — this is an injection target
+    # NOT protected — this is an injection target whose text gets erased
     return False
 
 
