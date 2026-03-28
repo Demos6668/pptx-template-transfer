@@ -41,6 +41,12 @@ python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --slide
 
 # Skip speaker notes transfer
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --no-notes
+
+# Analyze template shape classifications
+python3 pptx_template_transfer.py --analyze template.pptx
+
+# Extract structured content as JSON
+python3 pptx_template_transfer.py --extract content.pptx
 ```
 
 ## Programmatic API
@@ -63,6 +69,70 @@ config = TransferConfig(
     thresholds=Thresholds(title_min_font_pt=18, body_max_zones=3),
 )
 report = transfer(template, content, output, config)
+```
+
+### Shape Classification API
+
+Classify individual shapes or get all zones on a slide:
+
+```python
+from pptx import Presentation
+from pptx.util import Emu
+from pptx_template_transfer import classify_shape_role, get_slide_zones
+
+prs = Presentation("deck.pptx")
+slide = prs.slides[0]
+w, h = prs.slide_width, prs.slide_height
+
+# Classify a single shape
+for shape in slide.shapes:
+    role = classify_shape_role(shape, w, h, slide=slide)
+    print(f"{shape.name}: {role}")
+
+# Get all zones at once
+zones = get_slide_zones(slide, w, h)
+print(f"Title shapes: {len(zones['title'])}")
+print(f"Body shapes: {len(zones['body'])}")
+print(f"Decorative shapes: {len(zones['decorative'])}")
+print(f"Footer shapes: {len(zones['footer'])}")
+```
+
+## Analysis Modes
+
+### `--analyze`: Shape Classification Report
+
+Inspect how every shape on every slide is classified:
+
+```
+$ python3 pptx_template_transfer.py --analyze template.pptx
+
+Slide 1: 30 shapes — title:1  body:1  info:0  decorative:26  footer:2  media:0
+  Shape "Title 1" (12.3% area, top 15%) -> title (conf=0.95)
+  Shape "Text Box 3" (8.1% area, top 40%) -> body (conf=0.80)
+  Shape "Logo" (1.2% area, top 5%) -> decorative (conf=0.85)
+  ...
+```
+
+### `--extract`: Structured Content Export
+
+Extract slide content as JSON for automation or inspection:
+
+```
+$ python3 pptx_template_transfer.py --extract content.pptx
+
+[
+  {
+    "slide": 1,
+    "title": "Project Overview",
+    "body_paragraphs": [
+      {"text": "Key objectives for Q2", "level": 0, "bold": true},
+      {"text": "Increase coverage by 40%", "level": 1, "bold": false}
+    ],
+    "tables": 0,
+    "images": 1,
+    "notes": "Speaker notes here..."
+  }
+]
 ```
 
 ## How Design Mode Works
