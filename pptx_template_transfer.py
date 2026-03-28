@@ -496,6 +496,53 @@ def classify_all_shapes(
     return [(s, *results[id(s)]) for s in shapes]
 
 
+def classify_shape_role(
+    shape, slide_width: int, slide_height: int,
+    slide=None, th: Thresholds | None = None,
+) -> str:
+    """Public single-shape classifier. Returns "title"|"body"|"decorative"|"footer".
+
+    Note: For accurate title/body assignment (which depends on slide context),
+    prefer classify_all_shapes() or get_slide_zones() instead.
+    """
+    if th is None:
+        th = Thresholds()
+    si = _precompute_shape_info(shape, slide_width, slide_height)
+    role, _ = _classify_shape(
+        si, th, largest_font=si.font_size, median_font=si.font_size,
+        title_assigned=False, body_count=0, info_count=0, similar_ids=set(),
+    )
+    # Collapse "media" and "info" into the 4-role scheme
+    if role == "media":
+        return "decorative"
+    if role == "info":
+        return "body"
+    return role
+
+
+def get_slide_zones(
+    slide, slide_width: int, slide_height: int, th: Thresholds | None = None,
+) -> dict[str, list]:
+    """Classify every shape on a slide and return grouped zones.
+
+    Returns {"title": [shapes], "body": [shapes], "decorative": [shapes], "footer": [shapes]}
+    """
+    if th is None:
+        th = Thresholds()
+    classifications = classify_all_shapes(slide, slide_width, slide_height, th)
+    zones: dict[str, list] = {"title": [], "body": [], "decorative": [], "footer": []}
+    for shape, role, _conf in classifications:
+        if role == "title":
+            zones["title"].append(shape)
+        elif role in ("body", "info"):
+            zones["body"].append(shape)
+        elif role == "footer":
+            zones["footer"].append(shape)
+        else:  # decorative, media
+            zones["decorative"].append(shape)
+    return zones
+
+
 # ============================================================================
 # B. CONTENT STRUCTURE EXTRACTOR
 # ============================================================================
@@ -1759,16 +1806,84 @@ def transfer(
 
 
 # ============================================================================
-# CLI
+# CLI: ANALYSIS MODES
+# ============================================================================
+
+def _cli_analyze(pptx_path: Path) -> None:
+    """Run shape classification on every slide and print results."""
+    prs = Presentation(str(pptx_path))
+    sw, sh = prs.slide_width, prs.slide_height
+    th = Thresholds()
+
+    print(f"\nAnalyzing: {pptx_path}")
+    print(f"Slides: {len(prs.slides)}, Size: {Emu(sw).inches:.1f}\" x {Emu(sh).inches:.1f}\"\n")
+
+    for i, slide in enumerate(prs.slides):
+        zones = get_slide_zones(slide, sw, sh, th)
+        classifications = classify_all_shapes(slide, sw, sh, th)
+        total = len(list(slide.shapes))
+
+        print(f"Slide {i+1}/{len(prs.slides)}: {total} shapes")
+        print(f"  Zones: title={len(zones['title'])}, body={len(zones['body'])}, "
+              f"footer={len(zones['footer'])}, decorative={len(zones['decorative'])}")
+
+        for shape, role, conf in classifications:
+            text = _text_of(shape)
+            preview = f' "{text[:50]}"' if text else ""
+            area = round(_shape_area_pct(shape, sw, sh), 1)
+            top = round(_shape_top_frac(shape, sh) * 100)
+            print(f'    [{role:11s} {conf:.2f}] "{shape.name}" '
+                  f'({area}% area, top {top}%){preview}')
+        print()
+
+
+def _cli_extract(pptx_path: Path) -> None:
+    """Extract structured content from every slide and print as JSON."""
+    prs = Presentation(str(pptx_path))
+    sw, sh = prs.slide_width, prs.slide_height
+    th = Thresholds()
+    ct = len(prs.slides)
+
+    result = []
+    for i, slide in enumerate(prs.slides):
+        cd = extract_content(slide, i, ct, sw, sh, th)
+        slide_data = {
+            "slide": i + 1,
+            "slide_type": cd.slide_type,
+            "title": cd.title,
+            "word_count": cd.word_count,
+            "body_paragraphs": [
+                {"text": p.text, "bold": p.bold, "level": p.level}
+                for p in cd.body_paragraphs
+            ],
+            "tables": [
+                t["data"] for t in cd.tables
+            ],
+            "images": [
+                {"width": img[1], "height": img[2], "blob_size": len(img[0])}
+                for img in cd.images
+            ],
+            "has_chart": cd.has_chart,
+            "notes": cd.notes if cd.notes else None,
+        }
+        result.append(slide_data)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+# ============================================================================
+# CLI: MAIN
 # ============================================================================
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="PPTX Template Transfer - apply one deck's visual design to another's content.",
     )
-    parser.add_argument("template_pptx", type=Path, help="Template PPTX")
-    parser.add_argument("content_pptx", type=Path, help="Content PPTX")
-    parser.add_argument("output_pptx", type=Path, help="Output PPTX path")
+    parser.add_argument("template_pptx", type=Path, help="Template PPTX (or input for --analyze/--extract)")
+    parser.add_argument("content_pptx", type=Path, nargs="?", default=None,
+                        help="Content PPTX (not needed for --analyze/--extract)")
+    parser.add_argument("output_pptx", type=Path, nargs="?", default=None,
+                        help="Output PPTX path (not needed for --analyze/--extract)")
     parser.add_argument("--mode", choices=["design", "layout"], default=None)
     parser.add_argument("--slide-map", type=Path, default=None,
                         help='JSON: {"1": 3, "2": 1, ...}')
@@ -1778,6 +1893,10 @@ def main() -> None:
                         help="Write JSON diagnostics report to this path")
     parser.add_argument("--no-notes", action="store_true",
                         help="Skip speaker notes transfer")
+    parser.add_argument("--analyze", action="store_true",
+                        help="Analyze a single PPTX: classify every shape on every slide")
+    parser.add_argument("--extract", action="store_true",
+                        help="Extract structured content from a single PPTX as JSON")
 
     args = parser.parse_args()
 
@@ -1791,21 +1910,31 @@ def main() -> None:
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stdout)
 
-    # Validate inputs
+    # --- Single-file analysis modes ---
+    if args.analyze:
+        _validate_input(args.template_pptx, "Input")
+        _cli_analyze(args.template_pptx)
+        return
+
+    if args.extract:
+        _validate_input(args.template_pptx, "Input")
+        _cli_extract(args.template_pptx)
+        return
+
+    # --- Transfer mode: require content + output ---
+    if not args.content_pptx or not args.output_pptx:
+        parser.error("content_pptx and output_pptx are required for transfer mode")
+
     _validate_input(args.template_pptx, "Template")
     _validate_input(args.content_pptx, "Content")
 
-    # Build config
     slide_map = None
     if args.slide_map and args.slide_map.exists():
         slide_map = json.loads(args.slide_map.read_text())
 
     config = TransferConfig(
-        mode=args.mode,
-        verbose=args.verbose,
-        slide_map=slide_map,
-        preserve_notes=not args.no_notes,
-        report_path=args.report,
+        mode=args.mode, verbose=args.verbose, slide_map=slide_map,
+        preserve_notes=not args.no_notes, report_path=args.report,
     )
 
     mode = config.mode or detect_mode(args.template_pptx)
@@ -1822,9 +1951,7 @@ def main() -> None:
     else:
         report = apply_layout(args.template_pptx, args.content_pptx, args.output_pptx, config)
 
-    # Write JSON report
     if args.report:
-        # Strip non-serializable fields
         clean_report = json.loads(json.dumps(report, default=str))
         args.report.write_text(json.dumps(clean_report, indent=2))
         print(f"Report written to {args.report}")
