@@ -67,7 +67,7 @@ class Thresholds:
     info_min_words: int = 5
     info_max_words: int = 50
     # Content extraction
-    image_min_area_pct: float = 10.0
+    image_min_area_pct: float = 3.0
     subheading_min_font_pt: float = 18.0
     # Matching
     variety_max_pct: float = 0.40
@@ -2131,6 +2131,25 @@ def _rgb(hex_str: str) -> RGBColor:
     return RGBColor.from_string(hex_str)
 
 
+def _style_runs(
+    paragraph, *,
+    font_name: str, font_size_pt: float,
+    bold: bool = False, italic: bool = False,
+    color_hex: str = "111827",
+) -> None:
+    """Apply font properties to every run in a paragraph.
+
+    python-pptx paragraph-level font is a convenience proxy — it doesn't
+    always persist into the XML.  Setting on each run is authoritative.
+    """
+    for run in paragraph.runs:
+        run.font.name = font_name
+        run.font.size = Pt(font_size_pt)
+        run.font.bold = bold
+        run.font.italic = italic
+        run.font.color.rgb = _rgb(color_hex)
+
+
 def _add_background(slide, style: TemplateStyle) -> None:
     """Set slide background color."""
     bg = slide.background
@@ -2211,17 +2230,17 @@ def _add_header(
 
     # Section label (ALL-CAPS, small, primary color)
     if section_label:
+        # Sanitize non-ASCII for broad viewer compat
+        safe_label = section_label.upper().encode("ascii", "replace").decode("ascii")
         lbl = slide.shapes.add_textbox(
-            left, line_top - Pt(16), int(sw * 0.4), Pt(14),
+            left, line_top - Pt(16), int(sw * 0.6), Pt(14),
         )
         tf = lbl.text_frame
         tf.word_wrap = False
         p = tf.paragraphs[0]
-        p.text = section_label.upper()
-        p.font.name = style.heading_font
-        p.font.size = Pt(8)
-        p.font.bold = True
-        p.font.color.rgb = _rgb(style.color_primary)
+        p.text = safe_label
+        _style_runs(p, font_name=style.heading_font, font_size_pt=8,
+                     bold=True, color_hex=style.color_primary)
 
 
 def _add_logo(slide, style: TemplateStyle) -> None:
@@ -2263,9 +2282,8 @@ def _add_footer(
         tf.word_wrap = False
         p = tf.paragraphs[0]
         p.text = style.footer_company
-        p.font.name = style.body_font
-        p.font.size = font_size
-        p.font.color.rgb = _rgb(style.color_muted)
+        _style_runs(p, font_name=style.body_font, font_size_pt=7,
+                     color_hex=style.color_muted)
 
     # Confidential (center-right)
     if style.footer_has_confidential:
@@ -2276,9 +2294,8 @@ def _add_footer(
         tf.word_wrap = False
         p = tf.paragraphs[0]
         p.text = "Confidential"
-        p.font.name = style.body_font
-        p.font.size = font_size
-        p.font.color.rgb = _rgb(style.color_muted)
+        _style_runs(p, font_name=style.body_font, font_size_pt=7,
+                     color_hex=style.color_muted)
 
     # Page number (right)
     if style.footer_has_page_number:
@@ -2289,10 +2306,9 @@ def _add_footer(
         tf.word_wrap = False
         p = tf.paragraphs[0]
         p.text = f"Page {slide_number:02d}"
-        p.font.name = style.body_font
-        p.font.size = font_size
-        p.font.color.rgb = _rgb(style.color_muted)
         p.alignment = PP_ALIGN.RIGHT
+        _style_runs(p, font_name=style.body_font, font_size_pt=7,
+                     color_hex=style.color_muted)
 
 
 def _add_title_text(
@@ -2306,10 +2322,8 @@ def _add_title_text(
     tf.word_wrap = True
     p = tf.paragraphs[0]
     p.text = title
-    p.font.name = style.heading_font
-    p.font.size = Pt(font_size_pt)
-    p.font.bold = bold
-    p.font.color.rgb = _rgb(style.color_text)
+    _style_runs(p, font_name=style.heading_font, font_size_pt=font_size_pt,
+                 bold=bold, color_hex=style.color_text)
 
 
 def _add_body_text(
@@ -2331,22 +2345,17 @@ def _add_body_text(
             p = tf.add_paragraph()
 
         p.text = pd.text
-        p.font.name = style.body_font
         if pd.bold:
-            p.font.name = style.heading_font
-            p.font.size = Pt(14)
-            p.font.bold = True
-            p.font.color.rgb = _rgb(style.color_text)
             p.space_before = Pt(10)
-        else:
-            p.font.size = Pt(12)
-            p.font.color.rgb = _rgb(style.color_text)
-
-        # Indentation for bullet levels
-        if pd.level > 0:
+            _style_runs(p, font_name=style.heading_font, font_size_pt=14,
+                         bold=True, color_hex=style.color_text)
+        elif pd.level > 0:
             p.level = pd.level
-            p.font.size = Pt(11)
-            p.font.color.rgb = _rgb(style.color_muted)
+            _style_runs(p, font_name=style.body_font, font_size_pt=11,
+                         color_hex=style.color_muted)
+        else:
+            _style_runs(p, font_name=style.body_font, font_size_pt=12,
+                         color_hex=style.color_text)
 
 
 def _add_table(
@@ -2371,18 +2380,16 @@ def _add_table(
 
             # Format
             for p in cell.text_frame.paragraphs:
-                p.font.name = style.body_font
-                p.font.size = Pt(9)
-                p.font.color.rgb = _rgb(style.color_text)
+                _style_runs(p, font_name=style.body_font, font_size_pt=9,
+                             color_hex=style.color_text)
 
             # Header row styling
             if ri == 0:
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = _rgb(style.color_primary)
                 for p in cell.text_frame.paragraphs:
-                    p.font.bold = True
-                    p.font.color.rgb = _rgb("FFFFFF")
-                    p.font.size = Pt(9)
+                    _style_runs(p, font_name=style.body_font, font_size_pt=9,
+                                 bold=True, color_hex="FFFFFF")
             elif ri % 2 == 1:
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = _rgb(style.color_background)
@@ -2392,17 +2399,22 @@ def _add_content_images(
     slide, style: TemplateStyle,
     images: list[tuple],
     start_top: int,
+    has_body_text: bool = True,
 ) -> None:
     """Place content images on the slide."""
     sw, sh = style.slide_width, style.slide_height
     current_top = start_top
 
+    # If no body text, images can take more space
+    max_w_frac = 0.42 if has_body_text else 0.70
+    max_h_frac = 0.35 if has_body_text else 0.55
+
     for img_tuple in images:
         blob = img_tuple[0]
         orig_w, orig_h = img_tuple[1], img_tuple[2]
 
-        max_w = int(sw * 0.5)
-        max_h = int(sh * 0.3)
+        max_w = int(sw * max_w_frac)
+        max_h = int(sh * max_h_frac)
         avail_h = sh - current_top - int(sh * 0.08)
         if avail_h < int(sh * 0.1):
             break
@@ -2416,11 +2428,27 @@ def _add_content_images(
             w, h = max_w, max_h
 
         try:
-            left = sw - w - int(sw * 0.05)
+            left = sw - w - int(sw * 0.04)
             slide.shapes.add_picture(io.BytesIO(blob), left, current_top, w, h)
             current_top += h + Pt(8)
         except Exception:
             pass
+
+
+def _find_blank_layout(prs: Presentation):
+    """Find the blank slide layout (no placeholders, or named 'Blank')."""
+    # Prefer layout named "Blank" or "blank"
+    for layout in prs.slide_layouts:
+        if layout.name.strip().lower() in ("blank", "empty"):
+            return layout
+    # Fallback: layout with fewest placeholders
+    best = prs.slide_layouts[0]
+    best_count = len(best.placeholders)
+    for layout in prs.slide_layouts:
+        if len(layout.placeholders) < best_count:
+            best = layout
+            best_count = len(layout.placeholders)
+    return best
 
 
 def build_slide(
@@ -2428,7 +2456,7 @@ def build_slide(
     content: ContentData, slide_number: int, total_slides: int,
 ) -> None:
     """Build a single output slide from scratch."""
-    blank_layout = prs.slide_layouts[6]  # Blank layout
+    blank_layout = _find_blank_layout(prs)
     slide = prs.slides.add_slide(blank_layout)
     sw, sh = style.slide_width, style.slide_height
 
@@ -2510,7 +2538,8 @@ def build_slide(
 
         # Images on the right side
         if content.images:
-            _add_content_images(slide, style, content.images, body_top)
+            _add_content_images(slide, style, content.images, body_top,
+                                has_body_text=bool(content.body_paragraphs))
 
     # Speaker notes
     if content.notes:
@@ -2529,8 +2558,7 @@ def _build_title_slide(
 ) -> None:
     """Build a title/cover slide."""
     sw, sh = style.slide_width, style.slide_height
-
-    _add_logo(slide, style)
+    # NOTE: logo already added by build_slide() — no duplicate call here
 
     # Large centered title
     title_width = int(sw * 0.7)
@@ -2543,11 +2571,9 @@ def _build_title_slide(
         tf.word_wrap = True
         p = tf.paragraphs[0]
         p.text = content.title
-        p.font.name = style.heading_font
-        p.font.size = Pt(30)
-        p.font.bold = True
-        p.font.color.rgb = _rgb(style.color_text)
         p.alignment = PP_ALIGN.CENTER
+        _style_runs(p, font_name=style.heading_font, font_size_pt=30,
+                     bold=True, color_hex=style.color_text)
 
     # Subtitle / body paragraphs below title
     if content.body_paragraphs:
@@ -2565,10 +2591,9 @@ def _build_title_slide(
             else:
                 p = tf.add_paragraph()
             p.text = pd.text
-            p.font.name = style.body_font
-            p.font.size = Pt(14)
-            p.font.color.rgb = _rgb(style.color_muted)
             p.alignment = PP_ALIGN.CENTER
+            _style_runs(p, font_name=style.body_font, font_size_pt=14,
+                         color_hex=style.color_muted)
 
     # Accent line under title
     line_w = int(sw * 0.08)
@@ -2591,8 +2616,7 @@ def _build_section_slide(
 ) -> None:
     """Build a section divider slide."""
     sw, sh = style.slide_width, style.slide_height
-
-    _add_logo(slide, style)
+    # NOTE: logo already added by build_slide()
 
     # Large centered section title
     title_width = int(sw * 0.7)
@@ -2605,11 +2629,9 @@ def _build_section_slide(
         tf.word_wrap = True
         p = tf.paragraphs[0]
         p.text = content.title
-        p.font.name = style.heading_font
-        p.font.size = Pt(28)
-        p.font.bold = True
-        p.font.color.rgb = _rgb(style.color_text)
         p.alignment = PP_ALIGN.CENTER
+        _style_runs(p, font_name=style.heading_font, font_size_pt=28,
+                     bold=True, color_hex=style.color_text)
 
     _add_footer(slide, style, slide_number, total_slides)
 
@@ -2642,11 +2664,21 @@ def apply_recreate(
                   f"title='{cd.title[:40]}', paras={len(cd.body_paragraphs)}, "
                   f"tables={len(cd.tables)}, images={len(cd.images)}")
 
-    # Step 3: Build output
+    # Step 3: Build output — use template as base to preserve theme/masters
     print(f"\n[recreate] Building {ct} slides from scratch...")
-    output_prs = Presentation()
-    output_prs.slide_width = style.slide_width
-    output_prs.slide_height = style.slide_height
+    output_prs = Presentation(str(template_path))
+
+    # Remove all template slides but keep masters/theme
+    sld_id_lst = output_prs.slides._sldIdLst
+    ns_r = _NSMAP["r"]
+    for sld_id in list(sld_id_lst):
+        r_id = sld_id.get(f"{{{ns_r}}}id")
+        if r_id:
+            try:
+                output_prs.part.drop_rel(r_id)
+            except Exception:
+                pass
+        sld_id_lst.remove(sld_id)
 
     for i, cd in enumerate(content_list):
         slide_report: dict[str, Any] = {
@@ -2666,8 +2698,7 @@ def apply_recreate(
             print(f"  Slide {i+1}/{ct}: ERROR - {exc}")
             # Add blank slide as fallback
             try:
-                blank = output_prs.slide_layouts[6]
-                output_prs.slides.add_slide(blank)
+                output_prs.slides.add_slide(_find_blank_layout(output_prs))
             except Exception:
                 pass
         report["slides"].append(slide_report)
