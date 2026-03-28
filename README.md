@@ -10,7 +10,9 @@ Real-world branded PPTX files store all visual design (logos, decorative shapes,
 
 ## The Solution
 
-**Design mode** clones template slides as visual skeletons, classifies every shape's role, and injects content text ONLY into the right zones — leaving all branding untouched.
+**Recreate mode** (default) analyzes the template's visual DNA — colors, fonts, logo, layout — then rebuilds each slide from scratch using the content PPTX's text. Zero template text can leak because template slides are never copied.
+
+**Clone mode** (legacy) clones template slides as visual skeletons, classifies every shape's role, and injects content text into the right zones.
 
 ## Requirements
 
@@ -24,11 +26,14 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Auto-detect mode (design mode if layouts are blank, layout mode otherwise)
+# Default: recreate mode (analyze template style, rebuild slides from scratch)
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx
 
-# Explicit design mode
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode design
+# Explicit recreate mode
+python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode recreate
+
+# Legacy clone mode (clone template slides, inject content)
+python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode clone
 
 # Verbose diagnostics (every shape classification decision)
 python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --verbose
@@ -135,7 +140,36 @@ $ python3 pptx_template_transfer.py --extract content.pptx
 ]
 ```
 
-## How Design Mode Works
+## How Recreate Mode Works (default)
+
+1. **Analyze** the template PPTX to extract its visual DNA:
+   - Theme fonts (heading + body) from theme XML, with frequency-scan fallback
+   - Color palette: primary accent, text, muted, background — using saturation-based classification
+   - Logo: most frequently repeated image across slides
+   - Footer text: company name, confidential notice, page number format
+2. **Extract** structured content from each content slide (title, body paragraphs, tables, images, speaker notes)
+3. **Build** each output slide from scratch using `python-pptx`:
+   - Set background color from template
+   - Add decorative shapes (corner ellipse, triangle) using template colors
+   - Place logo in top-left
+   - Add header with section label and accent line
+   - Add title (heading font, bold) and body text (body font, with subheading detection)
+   - Build tables using template colors (header row in primary, alternating rows)
+   - Place content images on the right side
+   - Add footer with company name, "Confidential", and page number
+   - Transfer speaker notes
+
+### Why Recreate Mode
+
+| Problem | Clone approach | Recreate approach |
+|---------|---------------|-------------------|
+| Template text leaking | Can't fully clear | Never copied |
+| Broken XML relationships | Corrupt rIds | Clean new file |
+| LibreOffice won't render | Broken rels | Valid from scratch |
+| Tables lost | Flattened to text | Built with table API |
+| Works with ANY template | Depends on slide structure | Extracts style, rebuilds |
+
+## How Clone Mode Works (legacy)
 
 1. **Validate** input files (valid ZIP, has slides, correct format)
 2. **Extract** structured content from each slide (title, body paragraphs with subheading detection, tables, images, charts, speaker notes)

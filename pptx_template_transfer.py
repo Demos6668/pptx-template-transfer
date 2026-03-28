@@ -3,15 +3,16 @@
 
 Usage:
     python3 pptx_template_transfer.py template.pptx content.pptx output.pptx
-    python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode design
+    python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode recreate
     python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --verbose
     python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --report report.json
 
 Modes:
-    design  — Clone template slides as visual skeletons, inject content text (default
-              when template layouts are blank/default).
-    layout  — Transfer theme + masters + layouts between files (default when template
-              has named layouts with placeholders).
+    recreate — Analyze template style, extract content, rebuild from scratch (default).
+               Zero template text leakage, clean XML, works in any viewer.
+    clone    — Clone template slides as visual skeletons, inject content text.
+               (alias: design)
+    layout   — Transfer theme + masters + layouts between files.
 """
 
 from __future__ import annotations
@@ -33,9 +34,11 @@ from typing import Any
 
 from lxml import etree
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
-from pptx.util import Emu, Pt
+from pptx.util import Emu, Inches, Pt
 
 log = logging.getLogger("pptx_template_transfer")
 
@@ -1868,6 +1871,822 @@ def apply_design(
 
 
 # ============================================================================
+# RECREATE MODE — analyze → extract → rebuild from scratch
+# ============================================================================
+
+# ---- Step 1: Template Style Analyzer ----
+
+@dataclass
+class TemplateStyle:
+    """Visual DNA extracted from a template PPTX."""
+    slide_width: int = 0
+    slide_height: int = 0
+    heading_font: str = "Montserrat"
+    body_font: str = "Lato"
+    color_primary: str = "2563EB"
+    color_secondary: str = "F97316"
+    color_text: str = "111827"
+    color_muted: str = "475569"
+    color_background: str = "F7F8FB"
+    color_card: str = "FFFFFF"
+    color_line: str = "D1D5DB"
+    logo_blob: bytes | None = None
+    logo_content_type: str = "image/png"
+    logo_width: int = 0
+    logo_height: int = 0
+    footer_company: str = ""
+    footer_has_confidential: bool = True
+    footer_has_page_number: bool = True
+
+
+def _extract_theme_fonts(prs: Presentation) -> tuple[str, str]:
+    """Extract major/minor fonts from theme XML."""
+    ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    heading = "Montserrat"
+    body = "Lato"
+    try:
+        master = prs.slide_masters[0]
+        theme_el = master.element.find(f".//{{{ns_a}}}theme")
+        if theme_el is None:
+            # Try reading theme part directly
+            for rel in master.part.rels.values():
+                if "theme" in str(rel.reltype).lower():
+                    theme_xml = rel.target_part.blob
+                    theme_el = etree.fromstring(theme_xml)
+                    break
+        if theme_el is not None:
+            major = theme_el.find(f".//{{{ns_a}}}majorFont")
+            minor = theme_el.find(f".//{{{ns_a}}}minorFont")
+            if major is not None:
+                lat = major.find(f"{{{ns_a}}}latin")
+                if lat is not None and lat.get("typeface"):
+                    heading = lat.get("typeface")
+            if minor is not None:
+                lat = minor.find(f"{{{ns_a}}}latin")
+                if lat is not None and lat.get("typeface"):
+                    body = lat.get("typeface")
+    except Exception:
+        pass
+
+    # Fallback: frequency scan
+    if heading == body:
+        from collections import Counter
+        large_fonts: Counter[str] = Counter()
+        body_fonts: Counter[str] = Counter()
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if not shape.has_text_frame:
+                    continue
+                for para in shape.text_frame.paragraphs:
+                    for run in para.runs:
+                        if run.font.name:
+                            if run.font.size and run.font.size.pt >= 18:
+                                large_fonts[run.font.name] += len(run.text)
+                            else:
+                                body_fonts[run.font.name] += len(run.text)
+        if large_fonts:
+            heading = large_fonts.most_common(1)[0][0]
+        if body_fonts:
+            body = body_fonts.most_common(1)[0][0]
+    return heading, body
+
+
+def _extract_colors(prs: Presentation) -> dict[str, str]:
+    """Extract dominant colors from text runs and backgrounds."""
+    from collections import Counter
+    color_freq: Counter[str] = Counter()
+    bg_color = "F7F8FB"
+
+    # Background from first slide
+    try:
+        fill = prs.slides[0].background.fill
+        if fill.type is not None:
+            fc = fill.fore_color
+            if fc.type is not None and fc.rgb:
+                bg_color = str(fc.rgb)
+    except Exception:
+        pass
+
+    # Text colors
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            for para in shape.text_frame.paragraphs:
+                for run in para.runs:
+                    try:
+                        c = run.font.color
+                        if c and c.type is not None and c.rgb:
+                            color_freq[str(c.rgb)] += len(run.text)
+                    except (AttributeError, TypeError):
+                        pass
+
+    # Classify colors
+    text_color = "111827"
+    muted_color = "475569"
+    primary_color = "2563EB"
+    secondary_color = "F97316"
+
+    dark_colors = []
+    saturated_accents = []   # True accents (high saturation)
+    muted_accents = []       # Grayish mid-tones
+    for c, freq in color_freq.most_common(20):
+        r, g, b = int(c[:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        brightness = (r + g + b) / 3
+        max_ch, min_ch = max(r, g, b), min(r, g, b)
+        saturation = (max_ch - min_ch) / max_ch if max_ch > 0 else 0
+
+        if brightness < 80:
+            dark_colors.append((c, freq))
+        elif c != bg_color and brightness < 240:
+            if saturation > 0.4:
+                saturated_accents.append((c, freq))
+            elif brightness < 160:
+                muted_accents.append((c, freq))
+
+    if dark_colors:
+        text_color = dark_colors[0][0]
+    # Muted = most common grayish mid-tone or second dark
+    if muted_accents:
+        muted_color = muted_accents[0][0]
+    elif len(dark_colors) >= 2:
+        muted_color = dark_colors[1][0]
+    # Primary = most common saturated accent
+    if saturated_accents:
+        primary_color = saturated_accents[0][0]
+        if len(saturated_accents) >= 2:
+            secondary_color = saturated_accents[1][0]
+
+    return {
+        "text": text_color, "muted": muted_color,
+        "primary": primary_color, "secondary": secondary_color,
+        "background": bg_color, "card": "FFFFFF", "line": "D1D5DB",
+    }
+
+
+def _extract_logo(prs: Presentation) -> tuple[bytes | None, str, int, int]:
+    """Find the most common image across slides (likely a logo)."""
+    from collections import defaultdict
+    img_map: dict[int, list] = defaultdict(list)
+    for i, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            try:
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE or shape.shape_type == 13:
+                    blob = shape.image.blob
+                    key = hash(blob[:200])
+                    img_map[key].append((blob, shape.image.content_type,
+                                         shape.width, shape.height))
+            except Exception:
+                pass
+
+    best_blob = None
+    best_ct = "image/png"
+    best_w = best_h = 0
+    best_count = 0
+    for key, occurrences in img_map.items():
+        if len(occurrences) > best_count:
+            best_count = len(occurrences)
+            b, ct, w, h = occurrences[0]
+            best_blob, best_ct, best_w, best_h = b, ct, w, h
+
+    if best_count < 2:
+        return None, "image/png", 0, 0
+    return best_blob, best_ct, best_w, best_h
+
+
+def _extract_footer_text(prs: Presentation) -> str:
+    """Find the most common footer company text."""
+    from collections import Counter
+    footer_texts: Counter[str] = Counter()
+    sh = prs.slide_height
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            bottom = (shape.top or 0) + (shape.height or 0)
+            if bottom / sh > 0.90:
+                t = shape.text_frame.text.strip()
+                if t and not _FOOTER_PATTERNS.match(t) and not re.match(r"^Page\s*\d+$", t, re.I):
+                    footer_texts[t] += 1
+    if footer_texts:
+        return footer_texts.most_common(1)[0][0]
+    return ""
+
+
+def analyze_template(template_path: Path) -> TemplateStyle:
+    """Analyze a template PPTX and extract its visual DNA."""
+    prs = Presentation(str(template_path))
+    style = TemplateStyle()
+    style.slide_width = prs.slide_width
+    style.slide_height = prs.slide_height
+
+    # Fonts
+    style.heading_font, style.body_font = _extract_theme_fonts(prs)
+
+    # Colors
+    colors = _extract_colors(prs)
+    style.color_primary = colors["primary"]
+    style.color_secondary = colors["secondary"]
+    style.color_text = colors["text"]
+    style.color_muted = colors["muted"]
+    style.color_background = colors["background"]
+    style.color_card = colors["card"]
+    style.color_line = colors["line"]
+
+    # Logo
+    blob, ct, w, h = _extract_logo(prs)
+    style.logo_blob = blob
+    style.logo_content_type = ct
+    style.logo_width = w
+    style.logo_height = h
+
+    # Footer
+    style.footer_company = _extract_footer_text(prs)
+    style.footer_has_confidential = True
+    style.footer_has_page_number = True
+
+    return style
+
+
+# ---- Step 2: Content Extractor (reuses existing extract_content) ----
+
+def extract_all_content(
+    content_path: Path, th: Thresholds,
+) -> list[ContentData]:
+    """Extract structured content from every slide in a PPTX."""
+    prs = Presentation(str(content_path))
+    sw, sh = prs.slide_width, prs.slide_height
+    ct = len(prs.slides)
+    result = []
+    for i, slide in enumerate(prs.slides):
+        cd = extract_content(slide, i, ct, sw, sh, th)
+        result.append(cd)
+    return result
+
+
+# ---- Step 3: Slide Builder ----
+
+def _rgb(hex_str: str) -> RGBColor:
+    """Convert hex string to RGBColor."""
+    return RGBColor.from_string(hex_str)
+
+
+def _add_background(slide, style: TemplateStyle) -> None:
+    """Set slide background color."""
+    bg = slide.background
+    fill = bg.fill
+    fill.solid()
+    fill.fore_color.rgb = _rgb(style.color_background)
+
+
+def _add_decorative_shapes(slide, style: TemplateStyle) -> None:
+    """Add corner decorative shapes matching the template style."""
+    sw, sh = style.slide_width, style.slide_height
+
+    try:
+        from pptx.enum.shapes import MSO_SHAPE
+    except ImportError:
+        from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE as MSO_SHAPE
+
+    # Bottom-right ellipse (large, subtle)
+    ellipse_size = int(sw * 0.16)
+    ellipse = slide.shapes.add_shape(
+        MSO_SHAPE.OVAL,
+        sw - int(ellipse_size * 0.7),
+        sh - int(ellipse_size * 0.7),
+        ellipse_size, ellipse_size,
+    )
+    fill = ellipse.fill
+    fill.solid()
+    fill.fore_color.rgb = _rgb(style.color_primary)
+    # Set transparency via XML
+    ns_a = _NSMAP["a"]
+    solid_fill = ellipse._element.find(f".//{{{ns_a}}}solidFill")
+    if solid_fill is not None:
+        color_el = solid_fill[0] if len(solid_fill) else None
+        if color_el is not None:
+            alpha = etree.SubElement(color_el, f"{{{ns_a}}}alpha")
+            alpha.set("val", "25000")  # 25% opacity
+    ellipse.line.fill.background()  # no border
+
+    # Top-right triangle
+    tri_w = int(sw * 0.17)
+    tri_h = int(sh * 0.33)
+    triangle = slide.shapes.add_shape(
+        MSO_SHAPE.RIGHT_TRIANGLE,
+        sw - tri_w, 0,
+        tri_w, tri_h,
+    )
+    fill = triangle.fill
+    fill.solid()
+    fill.fore_color.rgb = _rgb(style.color_line)
+    solid_fill = triangle._element.find(f".//{{{ns_a}}}solidFill")
+    if solid_fill is not None:
+        color_el = solid_fill[0] if len(solid_fill) else None
+        if color_el is not None:
+            alpha = etree.SubElement(color_el, f"{{{ns_a}}}alpha")
+            alpha.set("val", "20000")  # 20% opacity
+    triangle.line.fill.background()
+    # Flip horizontal so hypotenuse faces left
+    triangle.rotation = 180.0
+
+
+def _add_header(
+    slide, style: TemplateStyle, section_label: str,
+) -> None:
+    """Add accent line and section label above the title area."""
+    sw = style.slide_width
+    left = int(sw * 0.054)
+    # Blue accent line
+    line_w = int(sw * 0.038)
+    line_h = Pt(3)
+    line_top = int(style.slide_height * 0.075)
+    line_shape = slide.shapes.add_shape(
+        1,  # MSO_SHAPE.RECTANGLE
+        left, line_top, line_w, int(line_h),
+    )
+    line_shape.fill.solid()
+    line_shape.fill.fore_color.rgb = _rgb(style.color_primary)
+    line_shape.line.fill.background()
+
+    # Section label (ALL-CAPS, small, primary color)
+    if section_label:
+        lbl = slide.shapes.add_textbox(
+            left, line_top - Pt(16), int(sw * 0.4), Pt(14),
+        )
+        tf = lbl.text_frame
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        p.text = section_label.upper()
+        p.font.name = style.heading_font
+        p.font.size = Pt(8)
+        p.font.bold = True
+        p.font.color.rgb = _rgb(style.color_primary)
+
+
+def _add_logo(slide, style: TemplateStyle) -> None:
+    """Add logo image in the top-left area."""
+    if not style.logo_blob:
+        return
+    try:
+        left = int(style.slide_width * 0.024)
+        top = int(style.slide_height * 0.030)
+        # Scale logo to reasonable size
+        max_w = int(style.slide_width * 0.12)
+        max_h = int(style.slide_height * 0.05)
+        w, h = style.logo_width, style.logo_height
+        if w > 0 and h > 0:
+            scale = min(max_w / w, max_h / h, 1.0)
+            w, h = int(w * scale), int(h * scale)
+        else:
+            w, h = max_w, max_h
+        slide.shapes.add_picture(io.BytesIO(style.logo_blob), left, top, w, h)
+    except Exception as exc:
+        log.warning("Logo placement failed: %s", exc)
+
+
+def _add_footer(
+    slide, style: TemplateStyle,
+    slide_number: int, total_slides: int,
+) -> None:
+    """Add footer bar with company name, confidential, page number."""
+    sw, sh = style.slide_width, style.slide_height
+    footer_top = int(sh * 0.94)
+    font_size = Pt(7)
+
+    # Company name (left)
+    if style.footer_company:
+        tb = slide.shapes.add_textbox(
+            int(sw * 0.04), footer_top, int(sw * 0.35), Pt(12),
+        )
+        tf = tb.text_frame
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        p.text = style.footer_company
+        p.font.name = style.body_font
+        p.font.size = font_size
+        p.font.color.rgb = _rgb(style.color_muted)
+
+    # Confidential (center-right)
+    if style.footer_has_confidential:
+        tb = slide.shapes.add_textbox(
+            int(sw * 0.42), footer_top, int(sw * 0.2), Pt(12),
+        )
+        tf = tb.text_frame
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        p.text = "Confidential"
+        p.font.name = style.body_font
+        p.font.size = font_size
+        p.font.color.rgb = _rgb(style.color_muted)
+
+    # Page number (right)
+    if style.footer_has_page_number:
+        tb = slide.shapes.add_textbox(
+            int(sw * 0.90), footer_top, int(sw * 0.07), Pt(12),
+        )
+        tf = tb.text_frame
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        p.text = f"Page {slide_number:02d}"
+        p.font.name = style.body_font
+        p.font.size = font_size
+        p.font.color.rgb = _rgb(style.color_muted)
+        p.alignment = PP_ALIGN.RIGHT
+
+
+def _add_title_text(
+    slide, style: TemplateStyle, title: str,
+    left: int, top: int, width: int,
+    font_size_pt: float = 22.0, bold: bool = True,
+) -> None:
+    """Add title text box."""
+    tb = slide.shapes.add_textbox(left, top, width, Pt(font_size_pt + 8))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = title
+    p.font.name = style.heading_font
+    p.font.size = Pt(font_size_pt)
+    p.font.bold = bold
+    p.font.color.rgb = _rgb(style.color_text)
+
+
+def _add_body_text(
+    slide, style: TemplateStyle,
+    paragraphs: list[ParagraphData],
+    left: int, top: int, width: int, max_height: int,
+) -> None:
+    """Add body text box with structured paragraphs."""
+    tb = slide.shapes.add_textbox(left, top, width, max_height)
+    tf = tb.text_frame
+    tf.word_wrap = True
+
+    first = True
+    for pd in paragraphs:
+        if first:
+            p = tf.paragraphs[0]
+            first = False
+        else:
+            p = tf.add_paragraph()
+
+        p.text = pd.text
+        p.font.name = style.body_font
+        if pd.bold:
+            p.font.name = style.heading_font
+            p.font.size = Pt(14)
+            p.font.bold = True
+            p.font.color.rgb = _rgb(style.color_text)
+            p.space_before = Pt(10)
+        else:
+            p.font.size = Pt(12)
+            p.font.color.rgb = _rgb(style.color_text)
+
+        # Indentation for bullet levels
+        if pd.level > 0:
+            p.level = pd.level
+            p.font.size = Pt(11)
+            p.font.color.rgb = _rgb(style.color_muted)
+
+
+def _add_table(
+    slide, style: TemplateStyle,
+    table_data: list[list[str]],
+    left: int, top: int, width: int, max_height: int,
+) -> None:
+    """Build a styled table from content data."""
+    if not table_data or not table_data[0]:
+        return
+    rows, cols = len(table_data), len(table_data[0])
+    row_height = min(Pt(24), max_height // rows) if rows else Pt(24)
+
+    shape = slide.shapes.add_table(rows, cols, left, top, width, rows * row_height)
+    table = shape.table
+
+    # Style each cell
+    for ri in range(rows):
+        for ci in range(min(cols, len(table_data[ri]) if ri < len(table_data) else 0)):
+            cell = table.cell(ri, ci)
+            cell.text = table_data[ri][ci] if ri < len(table_data) and ci < len(table_data[ri]) else ""
+
+            # Format
+            for p in cell.text_frame.paragraphs:
+                p.font.name = style.body_font
+                p.font.size = Pt(9)
+                p.font.color.rgb = _rgb(style.color_text)
+
+            # Header row styling
+            if ri == 0:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = _rgb(style.color_primary)
+                for p in cell.text_frame.paragraphs:
+                    p.font.bold = True
+                    p.font.color.rgb = _rgb("FFFFFF")
+                    p.font.size = Pt(9)
+            elif ri % 2 == 1:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = _rgb(style.color_background)
+
+
+def _add_content_images(
+    slide, style: TemplateStyle,
+    images: list[tuple],
+    start_top: int,
+) -> None:
+    """Place content images on the slide."""
+    sw, sh = style.slide_width, style.slide_height
+    current_top = start_top
+
+    for img_tuple in images:
+        blob = img_tuple[0]
+        orig_w, orig_h = img_tuple[1], img_tuple[2]
+
+        max_w = int(sw * 0.5)
+        max_h = int(sh * 0.3)
+        avail_h = sh - current_top - int(sh * 0.08)
+        if avail_h < int(sh * 0.1):
+            break
+        max_h = min(max_h, avail_h)
+
+        w, h = orig_w, orig_h
+        if w > 0 and h > 0:
+            scale = min(max_w / w, max_h / h, 1.0)
+            w, h = int(w * scale), int(h * scale)
+        else:
+            w, h = max_w, max_h
+
+        try:
+            left = sw - w - int(sw * 0.05)
+            slide.shapes.add_picture(io.BytesIO(blob), left, current_top, w, h)
+            current_top += h + Pt(8)
+        except Exception:
+            pass
+
+
+def build_slide(
+    prs: Presentation, style: TemplateStyle,
+    content: ContentData, slide_number: int, total_slides: int,
+) -> None:
+    """Build a single output slide from scratch."""
+    blank_layout = prs.slide_layouts[6]  # Blank layout
+    slide = prs.slides.add_slide(blank_layout)
+    sw, sh = style.slide_width, style.slide_height
+
+    # Margins
+    margin_left = int(sw * 0.054)
+    content_width = int(sw * 0.55)
+    title_top = int(sh * 0.12)
+    body_top = int(sh * 0.22)
+    body_max_h = int(sh * 0.65)
+
+    # Background
+    _add_background(slide, style)
+
+    # Decorative shapes (skip for title/section slides for cleaner look)
+    if content.slide_type not in ("title", "section"):
+        _add_decorative_shapes(slide, style)
+
+    # Logo
+    _add_logo(slide, style)
+
+    # Section label
+    section_label = ""
+    if content.slide_type == "title":
+        section_label = ""
+    elif content.slide_type == "section":
+        section_label = ""
+    elif content.slide_type == "data":
+        section_label = "DATA OVERVIEW"
+    elif content.slide_type == "closing":
+        section_label = "SUMMARY"
+    else:
+        # Derive from title
+        words = content.title.split()[:3] if content.title else []
+        section_label = " ".join(words).upper() if words else "OVERVIEW"
+
+    # --- Layout by slide type ---
+    if content.slide_type == "title":
+        _build_title_slide(slide, style, content, slide_number, total_slides)
+    elif content.slide_type == "section":
+        _build_section_slide(slide, style, content, slide_number, total_slides)
+    else:
+        # Header + footer for content/data/closing
+        _add_header(slide, style, section_label)
+        _add_footer(slide, style, slide_number, total_slides)
+
+        # Title
+        if content.title:
+            _add_title_text(
+                slide, style, content.title,
+                margin_left, title_top, content_width,
+            )
+
+        # Determine if we have images to place on the right
+        has_images = bool(content.images)
+
+        # Body text
+        if content.body_paragraphs:
+            bw = int(sw * 0.55) if has_images else int(sw * 0.85)
+            _add_body_text(
+                slide, style, content.body_paragraphs,
+                margin_left, body_top, bw, body_max_h,
+            )
+
+        # Tables
+        if content.tables:
+            table_top = body_top
+            if content.body_paragraphs:
+                # Estimate body height
+                est_lines = sum(1 + len(p.text) // 60 for p in content.body_paragraphs)
+                table_top = body_top + int(est_lines * Pt(16))
+                table_top = min(table_top, int(sh * 0.55))
+            for td in content.tables:
+                _add_table(
+                    slide, style, td["data"],
+                    margin_left, table_top, int(sw * 0.85),
+                    int(sh * 0.40),
+                )
+                break  # Only first table
+
+        # Images on the right side
+        if content.images:
+            _add_content_images(slide, style, content.images, body_top)
+
+    # Speaker notes
+    if content.notes:
+        try:
+            notes_slide = slide.notes_slide
+            tf = notes_slide.notes_text_frame
+            if tf:
+                tf.text = content.notes
+        except Exception:
+            pass
+
+
+def _build_title_slide(
+    slide, style: TemplateStyle, content: ContentData,
+    slide_number: int, total_slides: int,
+) -> None:
+    """Build a title/cover slide."""
+    sw, sh = style.slide_width, style.slide_height
+
+    _add_logo(slide, style)
+
+    # Large centered title
+    title_width = int(sw * 0.7)
+    title_left = (sw - title_width) // 2
+    title_top = int(sh * 0.28)
+
+    if content.title:
+        tb = slide.shapes.add_textbox(title_left, title_top, title_width, int(sh * 0.15))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = content.title
+        p.font.name = style.heading_font
+        p.font.size = Pt(30)
+        p.font.bold = True
+        p.font.color.rgb = _rgb(style.color_text)
+        p.alignment = PP_ALIGN.CENTER
+
+    # Subtitle / body paragraphs below title
+    if content.body_paragraphs:
+        sub_top = title_top + int(sh * 0.18)
+        sub_width = int(sw * 0.6)
+        sub_left = (sw - sub_width) // 2
+        tb = slide.shapes.add_textbox(sub_left, sub_top, sub_width, int(sh * 0.25))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        first = True
+        for pd in content.body_paragraphs:
+            if first:
+                p = tf.paragraphs[0]
+                first = False
+            else:
+                p = tf.add_paragraph()
+            p.text = pd.text
+            p.font.name = style.body_font
+            p.font.size = Pt(14)
+            p.font.color.rgb = _rgb(style.color_muted)
+            p.alignment = PP_ALIGN.CENTER
+
+    # Accent line under title
+    line_w = int(sw * 0.08)
+    line_left = (sw - line_w) // 2
+    line_top = title_top + int(sh * 0.14)
+    line_shape = slide.shapes.add_shape(
+        1,  # RECTANGLE
+        line_left, line_top, line_w, Pt(3),
+    )
+    line_shape.fill.solid()
+    line_shape.fill.fore_color.rgb = _rgb(style.color_primary)
+    line_shape.line.fill.background()
+
+    _add_footer(slide, style, slide_number, total_slides)
+
+
+def _build_section_slide(
+    slide, style: TemplateStyle, content: ContentData,
+    slide_number: int, total_slides: int,
+) -> None:
+    """Build a section divider slide."""
+    sw, sh = style.slide_width, style.slide_height
+
+    _add_logo(slide, style)
+
+    # Large centered section title
+    title_width = int(sw * 0.7)
+    title_left = (sw - title_width) // 2
+    title_top = int(sh * 0.35)
+
+    if content.title:
+        tb = slide.shapes.add_textbox(title_left, title_top, title_width, int(sh * 0.15))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = content.title
+        p.font.name = style.heading_font
+        p.font.size = Pt(28)
+        p.font.bold = True
+        p.font.color.rgb = _rgb(style.color_text)
+        p.alignment = PP_ALIGN.CENTER
+
+    _add_footer(slide, style, slide_number, total_slides)
+
+
+# ---- Step 4: Orchestrator ----
+
+def apply_recreate(
+    template_path: Path, content_path: Path, output_path: Path,
+    config: TransferConfig,
+) -> dict[str, Any]:
+    """Recreate mode: analyze template style, extract content, rebuild from scratch."""
+    report: dict[str, Any] = {"mode": "recreate", "slides": [], "warnings": [], "errors": []}
+    th = config.thresholds
+
+    # Step 1: Analyze template
+    print("\n[recreate] Analyzing template style...")
+    style = analyze_template(template_path)
+    print(f"  Fonts: heading={style.heading_font}, body={style.body_font}")
+    print(f"  Colors: primary=#{style.color_primary}, text=#{style.color_text}, bg=#{style.color_background}")
+    print(f"  Logo: {'found' if style.logo_blob else 'not found'} ({style.logo_width}x{style.logo_height})")
+    print(f"  Footer: '{style.footer_company}'")
+
+    # Step 2: Extract content
+    print("\n[recreate] Extracting content...")
+    content_list = extract_all_content(content_path, th)
+    ct = len(content_list)
+    for i, cd in enumerate(content_list):
+        if config.verbose:
+            print(f"  Slide {i+1}: type={cd.slide_type}, words={cd.word_count}, "
+                  f"title='{cd.title[:40]}', paras={len(cd.body_paragraphs)}, "
+                  f"tables={len(cd.tables)}, images={len(cd.images)}")
+
+    # Step 3: Build output
+    print(f"\n[recreate] Building {ct} slides from scratch...")
+    output_prs = Presentation()
+    output_prs.slide_width = style.slide_width
+    output_prs.slide_height = style.slide_height
+
+    for i, cd in enumerate(content_list):
+        slide_report: dict[str, Any] = {
+            "index": i + 1, "content_type": cd.slide_type,
+            "title": cd.title[:80] if cd.title else "", "word_count": cd.word_count,
+            "status": "ok",
+        }
+        try:
+            build_slide(output_prs, style, cd, i + 1, ct)
+            print(f"  Slide {i+1}/{ct}: [{cd.slide_type}] "
+                  f'"{cd.title[:50] if cd.title else "(no title)"}"')
+        except Exception as exc:
+            slide_report["status"] = "error"
+            slide_report["error"] = str(exc)
+            report["errors"].append(f"Slide {i+1}: {exc}")
+            log.error("Slide %d failed: %s\n%s", i + 1, exc, traceback.format_exc())
+            print(f"  Slide {i+1}/{ct}: ERROR - {exc}")
+            # Add blank slide as fallback
+            try:
+                blank = output_prs.slide_layouts[6]
+                output_prs.slides.add_slide(blank)
+            except Exception:
+                pass
+        report["slides"].append(slide_report)
+
+    # Save
+    print(f"\n[recreate] Saving to {output_path}...")
+    output_prs.save(str(output_path))
+    success = sum(1 for s in report["slides"] if s["status"] == "ok")
+    print(f"[recreate] Done! {success}/{ct} slides created successfully.")
+
+    if config.report_path:
+        clean = json.loads(json.dumps(report, default=str))
+        config.report_path.write_text(json.dumps(clean, indent=2))
+        print(f"Report written to {config.report_path}")
+
+    return report
+
+
+# ============================================================================
 # LAYOUT MODE (backward-compatible)
 # ============================================================================
 
@@ -1887,11 +2706,7 @@ def apply_layout(
 # ============================================================================
 
 def detect_mode(template_path: Path) -> str:
-    prs = Presentation(str(template_path))
-    generic = {"default", "blank", "empty", "custom", "custom layout", ""}
-    has_named = any(l.name.strip().lower() not in generic for l in prs.slide_layouts)
-    has_ph = any(len(l.placeholders) > 0 for l in prs.slide_layouts)
-    return "layout" if (has_named and has_ph) else "design"
+    return "recreate"  # New default: always use recreate mode
 
 
 # ============================================================================
@@ -1914,7 +2729,9 @@ def transfer(
     if output is None:
         output = Path("output.pptx")
 
-    if mode == "design":
+    if mode == "recreate":
+        return apply_recreate(template, content, output, config)
+    if mode == "design" or mode == "clone":
         return apply_design(template, content, output, config)
     return apply_layout(template, content, output, config)
 
@@ -1998,7 +2815,7 @@ def main() -> None:
                         help="Content PPTX (not needed for --analyze/--extract)")
     parser.add_argument("output_pptx", type=Path, nargs="?", default=None,
                         help="Output PPTX path (not needed for --analyze/--extract)")
-    parser.add_argument("--mode", choices=["design", "layout"], default=None)
+    parser.add_argument("--mode", choices=["recreate", "design", "clone", "layout"], default=None)
     parser.add_argument("--slide-map", type=Path, default=None,
                         help='JSON: {"1": 3, "2": 1, ...}')
     parser.add_argument("--layout-map", type=Path, default=None)
@@ -2060,7 +2877,9 @@ def main() -> None:
         report_path=config.report_path,
     )
 
-    if mode == "design":
+    if mode == "recreate":
+        report = apply_recreate(args.template_pptx, args.content_pptx, args.output_pptx, config)
+    elif mode in ("design", "clone"):
         report = apply_design(args.template_pptx, args.content_pptx, args.output_pptx, config)
     else:
         report = apply_layout(args.template_pptx, args.content_pptx, args.output_pptx, config)
