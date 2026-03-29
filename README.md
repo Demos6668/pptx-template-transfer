@@ -1,18 +1,30 @@
 # PPTX Template Transfer
 
-Apply one deck's visual design — logos, shapes, backgrounds, branding — to another deck's text content. Built on `python-pptx`.
+Apply one deck's visual design -- logos, colors, fonts, layout patterns -- to another deck's content. Built on `python-pptx`.
 
-**Single file. One command. Any PPTX pair.**
+**Source content is the authority. Target style is the grammar. Zero target body text leaks.**
 
 ## The Problem
 
-Real-world branded PPTX files store all visual design (logos, decorative shapes, watermarks, backgrounds) as shapes inside individual slides, NOT in slide masters/layouts. The layouts are often just "BLANK." Traditional layout/master transfer does nothing useful for these files.
+Branded PPTX files store visual design (logos, decorative shapes, watermarks, backgrounds) as shapes inside slides, not in slide masters/layouts. Traditional layout/master transfer does nothing useful for these files.
 
 ## The Solution
 
-**Recreate mode** (default) analyzes the template's visual DNA — colors, fonts, logo, layout — then rebuilds each slide from scratch using the content PPTX's text. Zero template text can leak because template slides are never copied.
+The engine **analyzes the target template's visual DNA** (colors, fonts, logo, layout patterns) then **rebuilds each slide from scratch** using the source deck's content. Template slides are never copied -- they're only read for style extraction -- so zero template text can leak into the output.
 
-**Clone mode** (legacy) clones template slides as visual skeletons, classifies every shape's role, and injects content text into the right zones.
+### Pipeline
+
+```
+Source PPTX (content)     Target PPTX (style)
+       |                         |
+  Extract content          Analyze visual DNA
+  Classify slide types     Mine layout patterns
+       |                         |
+       +--------> Rebuild <------+
+                    |
+            Output PPTX
+       (source meaning, target grammar)
+```
 
 ## Requirements
 
@@ -23,295 +35,264 @@ Real-world branded PPTX files store all visual design (logos, decorative shapes,
 pip install -r requirements.txt
 ```
 
-## Usage
+## Quick Start
+
+### CLI
 
 ```bash
-# Default: recreate mode (analyze template style, rebuild slides from scratch)
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx
+# template = style source, content = content source
+python -m pptx_template_transfer.cli template.pptx content.pptx output.pptx
 
-# Explicit recreate mode
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode recreate
-
-# Legacy clone mode (clone template slides, inject content)
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --mode clone
-
-# Verbose diagnostics (every shape classification decision)
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --verbose
+# With verbose diagnostics
+python -m pptx_template_transfer.cli template.pptx content.pptx output.pptx --verbose
 
 # JSON report for automation
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --report report.json
-
-# Manual slide mapping
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --slide-map mapping.json
-
-# Skip speaker notes transfer
-python3 pptx_template_transfer.py template.pptx content.pptx output.pptx --no-notes
+python -m pptx_template_transfer.cli template.pptx content.pptx output.pptx --report report.json
 
 # Analyze template shape classifications
-python3 pptx_template_transfer.py --analyze template.pptx
+python -m pptx_template_transfer.cli --analyze template.pptx
 
 # Extract structured content as JSON
-python3 pptx_template_transfer.py --extract content.pptx
+python -m pptx_template_transfer.cli --extract content.pptx
 ```
 
-## Programmatic API
+### Programmatic API
 
 ```python
-from pptx_template_transfer import transfer, TransferConfig, Thresholds
+from pathlib import Path
+from pptx_template_transfer import transfer, TransferConfig, Thresholds, BrandingPolicy
 
 # Basic usage
 report = transfer(
-    template=Path("template.pptx"),
-    content=Path("content.pptx"),
+    template=Path("template.pptx"),   # style source
+    content=Path("content.pptx"),     # content source
     output=Path("output.pptx"),
 )
 
-# Custom config
+# Full configuration
 config = TransferConfig(
-    mode="design",
+    mode="recreate",
     verbose=True,
     preserve_notes=True,
-    thresholds=Thresholds(title_min_font_pt=18, body_max_zones=3),
+    thresholds=Thresholds(title_min_font_pt=18),
+    branding=BrandingPolicy(
+        mode="target",
+        footer_company_override="My Company",
+        confidentiality_label="Internal Only",
+    ),
 )
 report = transfer(template, content, output, config)
+
+# Report includes provenance, coverage, and quality
+print(report["source_coverage"]["overall_pct"])   # e.g. 100.0
+print(report["quality"]["overall_score"])          # e.g. 95.0
 ```
 
-### Shape Classification API
+## Package Structure
 
-Classify individual shapes or get all zones on a slide:
+```
+pptx_template_transfer/
+  __init__.py              # Public API re-exports
+  cli.py                   # CLI entry point and transfer() orchestrator
+  helpers.py               # Shared utilities (text_of, word_count, style_runs, etc.)
+  models.py                # All dataclasses (config, content, provenance, quality)
+  analysis/
+    theme_extractor.py     # Extract visual DNA from template (fonts, colors, logo, footer)
+    slide_classifier.py    # Classify shape roles and slide types
+    layout_patterns.py     # Mine layout archetypes from template slides
+  extraction/
+    content_extractor.py   # Extract structured content from source slides
+    semantic_blocks.py     # Group paragraphs into semantic blocks
+  transform/
+    slide_builder.py       # Recreate mode: build slides from scratch with type-specific renderers
+    clone_injector.py      # Clone mode (legacy): clone template slides, inject content
+    layout_mapper.py       # Map content to layout zones
+    overflow_resolver.py   # Detect and resolve text overflow
+  validation/
+    contamination_checker.py  # Detect target body-text contamination via Jaccard n-gram similarity
+    source_coverage.py        # Track per-slide source content coverage
+    quality_report.py         # Per-slide quality scoring with acceptance gates
+    overlap_checker.py        # Detect shape overlaps
+    bounds_checker.py         # Detect shapes extending beyond slide edges
+```
+
+## How It Works
+
+### 1. Template Analysis
+
+Extracts the target deck's visual DNA:
+- **Fonts**: Heading and body fonts from theme XML, with frequency-scan fallback
+- **Colors**: Primary, secondary, text, muted, background, card, line -- using saturation-based classification
+- **Logo**: Most frequently repeated image across slides
+- **Footer**: Company name, confidentiality notice, page number format (requires 2+ slide repetition)
+- **Layout patterns**: Column counts, zone roles, text capacities
+
+### 2. Content Extraction
+
+Parses each source slide into structured data:
+- **Title**: Multi-signal scoring (placeholder type, font size, position, word count)
+- **Body paragraphs**: Ordered text with level, bold/italic, font size, per-run hyperlinks
+- **Tables**: Cell text matrices with formatting
+- **Images**: Content images above area threshold
+- **Charts**: Chart elements for transfer
+- **Speaker notes**: Full text from notes pane
+- **Slide type**: title, agenda, content_narrative, metrics_dashboard, comparison, image_heavy, etc.
+
+### 3. Slide Building
+
+Each output slide is built from scratch using type-specific renderers:
+
+| Slide Type | Renderer | Layout |
+|------------|----------|--------|
+| `title` | Title slide | Centered title + subtitle |
+| `section` | Section divider | Large section name |
+| `agenda` | Agenda/TOC | Bullet list of items |
+| `metrics_dashboard` | KPI cards | Numbered metric cards |
+| `comparison` | KPI layout | Side-by-side analysis |
+| `content_narrative` | Generic content | Section label + title + body |
+| `image_heavy` | Generic content | Text + image placement |
+| Incident slides | Incident renderer | Summary/Actions + Details cards |
+
+Every slide gets:
+- Background color from template
+- Decorative accent shapes in template colors
+- Logo in top-left
+- Section label (auto-generated from slide type or title)
+- Footer with company name, confidentiality label, page number
+
+### 4. Content Provenance
+
+Every output block is tagged with its origin:
+
+| Tag | Meaning |
+|-----|---------|
+| `source_content` | Body text, titles -- from source deck |
+| `target_shell` | Footer, logo, decorative shapes -- from template |
+| `converter_generated_bridge` | Section labels, bridge text -- generated |
+
+**Hard rule**: Body content must come from `source_content`. Target deck body copy never appears in output.
+
+### 5. Post-Generation Validation
+
+After building, the pipeline automatically runs:
+
+- **Target contamination check**: Jaccard 3-gram similarity between output and target body text. Flags if >40% similarity.
+- **Source coverage report**: Per-slide word-level overlap tracking. Warns if overall coverage is weak.
+- **Quality scoring**: Per-slide composite score (coverage - overlap/bounds/font penalties). Acceptance gate at 50/100.
+- **Text leakage detection**: Finds non-boilerplate sentences duplicated across slides.
+- **Bounds/overlap checking**: Detects shapes extending off-slide or overlapping.
+
+## Configuration
+
+### Thresholds
+
+All classification thresholds are configurable:
 
 ```python
-from pptx import Presentation
-from pptx.util import Emu
-from pptx_template_transfer import classify_shape_role, get_slide_zones
+from pptx_template_transfer import Thresholds
 
-prs = Presentation("deck.pptx")
-slide = prs.slides[0]
-w, h = prs.slide_width, prs.slide_height
-
-# Classify a single shape
-for shape in slide.shapes:
-    role = classify_shape_role(shape, w, h, slide=slide)
-    print(f"{shape.name}: {role}")
-
-# Get all zones at once
-zones = get_slide_zones(slide, w, h)
-print(f"Title shapes: {len(zones['title'])}")
-print(f"Body shapes: {len(zones['body'])}")
-print(f"Decorative shapes: {len(zones['decorative'])}")
-print(f"Footer shapes: {len(zones['footer'])}")
+th = Thresholds(
+    title_min_font_pt=16,        # Min font size to consider as title
+    body_min_area_pct=3.0,       # Min area % for body shapes
+    body_max_zones=3,            # Max body text zones per slide
+    decorative_max_area_pct=2.0, # Max area % for decorative shapes
+    image_min_area_pct=1.5,      # Min area % for content images
+    overflow_max_font_scale=0.70,# Min font scale before overflow warning
+)
 ```
 
-## Analysis Modes
+### Branding Policy
 
-### `--analyze`: Shape Classification Report
+Control how source and target branding appear in the output:
 
-Inspect how every shape on every slide is classified:
+```python
+from pptx_template_transfer import BrandingPolicy
 
-```
-$ python3 pptx_template_transfer.py --analyze template.pptx
-
-Slide 1: 30 shapes — title:1  body:1  info:0  decorative:26  footer:2  media:0
-  Shape "Title 1" (12.3% area, top 15%) -> title (conf=0.95)
-  Shape "Text Box 3" (8.1% area, top 40%) -> body (conf=0.80)
-  Shape "Logo" (1.2% area, top 5%) -> decorative (conf=0.85)
-  ...
-```
-
-### `--extract`: Structured Content Export
-
-Extract slide content as JSON for automation or inspection:
-
-```
-$ python3 pptx_template_transfer.py --extract content.pptx
-
-[
-  {
-    "slide": 1,
-    "title": "Project Overview",
-    "body_paragraphs": [
-      {"text": "Key objectives for Q2", "level": 0, "bold": true},
-      {"text": "Increase coverage by 40%", "level": 1, "bold": false}
-    ],
-    "tables": 0,
-    "images": 1,
-    "notes": "Speaker notes here..."
-  }
-]
+branding = BrandingPolicy(
+    mode="target",                          # "target" | "source" | "hybrid"
+    footer_company_override="My Company",   # Override auto-detected footer text
+    confidentiality_label="Internal Only",  # Override "Confidential" label
+    add_source_attribution=True,            # Add "Presented by" on title slide
+    source_company="Acme Corp",             # Source company name for attribution
+)
 ```
 
-## How Recreate Mode Works (default)
+## Transfer Report
 
-1. **Analyze** the template PPTX to extract its visual DNA:
-   - Theme fonts (heading + body) from theme XML, with frequency-scan fallback
-   - Color palette: primary accent, text, muted, background — using saturation-based classification
-   - Logo: most frequently repeated image across slides
-   - Footer text: company name, confidential notice, page number format
-2. **Extract** structured content from each content slide (title, body paragraphs, tables, images, speaker notes)
-3. **Build** each output slide from scratch using `python-pptx`:
-   - Set background color from template
-   - Add decorative shapes (corner ellipse, triangle) using template colors
-   - Place logo in top-left
-   - Add header with section label and accent line
-   - Add title (heading font, bold) and body text (body font, with subheading detection)
-   - Build tables using template colors (header row in primary, alternating rows)
-   - Place content images on the right side
-   - Add footer with company name, "Confidential", and page number
-   - Transfer speaker notes
-
-### Why Recreate Mode
-
-| Problem | Clone approach | Recreate approach |
-|---------|---------------|-------------------|
-| Template text leaking | Can't fully clear | Never copied |
-| Broken XML relationships | Corrupt rIds | Clean new file |
-| LibreOffice won't render | Broken rels | Valid from scratch |
-| Tables lost | Flattened to text | Built with table API |
-| Works with ANY template | Depends on slide structure | Extracts style, rebuilds |
-
-## How Clone Mode Works (legacy)
-
-1. **Validate** input files (valid ZIP, has slides, correct format)
-2. **Extract** structured content from each slide (title, body paragraphs with subheading detection, tables, images, charts, speaker notes)
-3. **Classify** each template slide's structure: title, narrative, list, grid, data, visual, section, closing
-4. **Match** each content slide to the best template using type compatibility, text density, content structure, and position — with variety enforcement
-5. **Clone** the matched template slide (preserving ALL shapes, backgrounds, transitions, media)
-6. **Classify** every shape on the cloned slide: title | body | info | decorative | footer | media — with confidence scoring
-7. **Inject** content ONLY into title/body/info zones — all other shapes protected
-8. **Handle** tables (fill with content data, expand rows if needed), charts (best-effort cloning), and images (place in available space)
-9. **Transfer** speaker notes from content to output
-10. **Post-process** page numbers and dates (both text patterns and XML placeholders)
-11. **Validate** output for orphaned shapes or missing content
-
-### Shape Role Classification
-
-Each shape is classified using multiple signals:
-
-| Signal | Priority | Description |
-|--------|----------|-------------|
-| **Placeholder type** | Highest | PowerPoint's `PP_PLACEHOLDER.TITLE/BODY/FOOTER` |
-| **Shape name** | High | "title", "body", "content" in auto-generated names |
-| **Position + area** | Medium | Footer zone (bottom 10%), header zone (top 8%) |
-| **Font size** | Medium | Adaptive thresholds based on slide-level statistics |
-| **Text patterns** | Medium | "Page XX", "Confidential", dates, ALL-CAPS labels |
-| **Repeated patterns** | Medium | 3+ shapes with similar size in a row/grid → decorative |
-| **Word count** | Lower | ≤3 words → likely decorative, >10 words → likely body |
-
-Each classification includes a **confidence score** (0.0-1.0) visible in verbose mode.
-
-| Role | Max per slide | Action |
-|------|--------------|--------|
-| **title** | 1 | Text replaced with content title |
-| **body** | 2 | Text replaced with content paragraphs (multi-level format preserved) |
-| **info** | 1 | Text replaced with content summary (first 3 paragraphs) |
-| **footer** | unlimited | Protected (page numbers auto-updated) |
-| **media** | unlimited | Protected (pictures, charts, tables, groups, OLE) |
-| **decorative** | unlimited | Protected (logos, labels, diagrams, branding) |
-
-### Content Structure Extraction
-
-Each content slide is parsed into:
-- **Title**: Largest-font short text near the top
-- **Body paragraphs**: Ordered text with subheading detection (bold/large font), indentation levels, per-run hyperlinks
-- **Tables**: Cell text matrices with formatting
-- **Images**: Content images >10% of slide area
-- **Charts**: Chart elements for best-effort cloning
-- **Speaker notes**: Full text from notes pane
-
-### Formatting Preservation
-
-- **Multi-level format**: Each indent level (0-8) gets its own saved formatting from the template
-- **Bullet styles**: `buChar`, `buAutoNum`, `buFont` preserved from template paragraph properties
-- **Bold/italic subheadings**: Detected in content and applied during injection
-- **Overflow prevention**: Estimates shape text capacity; truncates with "..." if content exceeds it
-
-### Slide Matching
-
-```
-Score = type_compatibility (0-40) + text_density_fit (0-25)
-      + content_structure_fit (0-20) + position_preference (0-15)
-```
-
-**Variety enforcement**: No template slide gets >40% of mappings. Unused templates are redistributed.
-
-### Table Handling
-
-- Template has table + content has table → content fills template cells (preserving cell formatting)
-- Content table has more rows → template table is expanded (row cloning)
-- No table in template → content table element added to slide
-
-### Robustness
-
-- **Per-slide error isolation**: One failed slide doesn't abort the entire deck
-- **Input validation**: Checks for valid ZIP, Content_Types.xml, non-zero slides
-- **Broken relationship recovery**: Logs broken rIds instead of silent failure
-- **Large deck support**: Pre-computed ShapeInfo cache, single-pass property extraction
-
-## Verbose Mode
-
-```
-Slide 4/16:
-  Content type: content (79 words, 0 table(s), 1 image(s))
-  Template match: slide 6 (score=75, type=narrative)
-  Shape classifications:
-    Shape "Shape 0" (4.6% area, top 67%, conf=0.85) -> footer
-    Shape "Text 3" (6.8% area, top 11%, conf=0.85) "Day2.Work..." -> title
-    Shape "Text 7" (7.9% area, top 42%, conf=0.80) "24x7 ..." -> body
-    ...
-  Injected: title="Deployment Overview"
-  Injected: body (75 words -> 2 zones)
-  Protected: 27 shapes untouched
-```
-
-## JSON Report
-
-Use `--report report.json` for machine-readable output:
+The `transfer()` function returns a comprehensive report:
 
 ```json
 {
-  "mode": "design",
+  "mode": "recreate",
   "slides": [
     {
       "index": 1,
+      "source_slide": 1,
       "content_type": "title",
-      "template_slide": 1,
-      "template_type": "title",
       "title": "Managed Detection and Response (MDR) Report",
       "word_count": 17,
       "status": "ok",
-      "protected_shapes": 27,
-      "classifications": [...]
+      "provenance": {
+        "title": "source_content",
+        "body": "source_content",
+        "footer": "target_shell",
+        "section_label": "converter_generated_bridge"
+      }
     }
   ],
+  "source_coverage": {
+    "overall_pct": 100.0,
+    "total_source_slides": 16,
+    "total_output_slides": 16,
+    "unmapped": [],
+    "entries": [...]
+  },
+  "quality": {
+    "overall_score": 100.0,
+    "native_count": 16,
+    "fallback_count": 0,
+    "slides_needing_review": []
+  },
   "warnings": [],
   "errors": []
 }
 ```
 
-## Configuration
+## Testing
 
-All classification thresholds are configurable via the `Thresholds` dataclass:
+```bash
+# Unit tests (76 tests)
+python -m pytest test_pptx_template_transfer.py -v
 
-```python
-from pptx_template_transfer import Thresholds
+# Regression tests (26 tests, requires sample decks)
+python -m pytest test_regression.py -v
 
-# For templates with smaller fonts
-th = Thresholds(title_min_font_pt=16, decorative_max_font_pt=8)
-
-# For templates with more body zones
-th = Thresholds(body_max_zones=3, body_min_area_pct=3.0)
+# All tests
+python -m pytest -v
 ```
+
+Regression tests verify:
+- Source content is the primary authority in output
+- No target body-text contamination
+- Source coverage >= 50%
+- Content provenance is tracked correctly
+- Target shell (fonts, colors, footer) is preserved
+- Slide-type classification works
+- Section labels are clean (no trailing punctuation/prepositions)
+- Incident slides are labeled correctly
+- Per-slide quality scores exist and pass acceptance gate
+- Quality score >= 50/100
+- No empty slides or text leakage
 
 ## Technical Notes
 
 - Built on `python-pptx` with `lxml` for low-level XML manipulation
-- Slide cloning deep-copies all shape elements and remaps relationship IDs
-- Transitions are preserved from template slides
-- Speaker notes transferred from content to output
-- Text injection preserves template run properties per indent level
-- Table cell formatting preserved during data fill (not stripped by `cell.text = ...`)
-- Chart transfer is best-effort (copies chart part + element)
-- Output uses the template's slide dimensions
+- Run-level font styling via `style_runs()` -- paragraph-level `.font.name` doesn't persist in XML
+- Theme inheritance: `Presentation(template_path)` preserves slide masters/theme
+- Aspect ratio detection: 4:3 vs 16:9 triggers reflowed layout (15% threshold)
+- Density-aware font scaling based on line count
+- Footer detection requires text repetition on 2+ slides to avoid false positives
+- Per-slide error isolation: one failed slide doesn't abort the deck
 
 ## License
 
